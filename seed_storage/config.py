@@ -142,7 +142,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_file_credentials(self) -> Settings:
-        """Load file-mode credentials (ant-keeper managed paths)."""
+        """Load file-mode credentials (ant-keeper managed paths).
+
+        File credentials take priority over env vars that contain iron-proxy
+        proxy tokens (``ptok_*``), which are useless for non-HTTP protocols
+        like Discord's WebSocket gateway.
+        """
         pairs = [
             ("NEO4J_PASSWORD_PATH", "NEO4J_PASSWORD"),
             ("DISCORD_BOT_TOKEN_PATH", "DISCORD_BOT_TOKEN"),
@@ -151,10 +156,25 @@ class Settings(BaseSettings):
         ]
         for path_field, value_field in pairs:
             path = getattr(self, path_field)
-            if path and not getattr(self, value_field):
+            current = getattr(self, value_field)
+            is_proxy_token = isinstance(current, str) and current.startswith("ptok_")
+            if path and (not current or is_proxy_token):
                 val = _read_file(path)
                 if val:
                     object.__setattr__(self, value_field, val)
+        return self
+
+    @model_validator(mode="after")
+    def _strip_bot_prefix(self) -> Settings:
+        """Strip ``Bot `` prefix from Discord token if present.
+
+        Ant-keeper stores Discord bot tokens with the ``Bot `` prefix per
+        convention.  discord.py adds the prefix itself, so passing the stored
+        value as-is causes ``Authorization: Bot Bot <token>`` → 401.
+        """
+        token = self.DISCORD_BOT_TOKEN
+        if token.startswith("Bot "):
+            object.__setattr__(self, "DISCORD_BOT_TOKEN", token[4:])
         return self
 
     @model_validator(mode="after")
