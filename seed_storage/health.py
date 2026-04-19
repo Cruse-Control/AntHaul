@@ -51,7 +51,7 @@ BOT_CONNECTED_KEY = "seed:bot:connected"
 CELERY_RAW_QUEUE = "raw_messages"
 CELERY_GRAPH_QUEUE = "graph_ingest"
 
-CHECK_TIMEOUT = 5.0  # seconds — per-check timeout
+CHECK_TIMEOUT = 2.0  # seconds — per-check timeout (must fit within k8s liveness probe)
 
 
 # ── Individual check functions (module-level for testability) ──────────────
@@ -267,7 +267,10 @@ async def health_handler(request: web.Request) -> web.Response:
         },
         "details": details,
     }
-    return web.json_response(body, status=200 if is_healthy else 503)
+    # Always return 200 for liveness probe — body contains actual health status
+    # for monitoring tools. Returning 503 causes unnecessary pod restarts when
+    # downstream dependencies (Celery inspector) are slow to respond.
+    return web.json_response(body, status=200)
 
 
 # ── aiohttp app ────────────────────────────────────────────────────────────
