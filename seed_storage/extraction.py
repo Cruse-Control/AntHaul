@@ -111,9 +111,17 @@ Known entities and aliases:
 
 
 def _apply_coreference(text: str, alias_map: dict[str, str]) -> str:
-    """Replace known aliases in text with canonical names."""
+    """Replace known aliases in text with canonical names.
+
+    Skips short aliases (<6 chars) that are common first names to avoid
+    partial-match problems like 'Flynn A. Cruse' → 'flynn cruse A. Cruse'.
+    """
     for alias, canonical in sorted(alias_map.items(), key=lambda x: -len(x[0])):
         if alias == canonical:
+            continue
+        # Skip very short aliases (first names) — they cause partial-match problems.
+        # e.g. "flynn" matching inside "Flynn A. Cruse" → "flynn cruse A. Cruse"
+        if len(alias) < 6:
             continue
         # Word-boundary replacement to avoid partial matches
         pattern = re.compile(r'\b' + re.escape(alias) + r'\b', re.IGNORECASE)
