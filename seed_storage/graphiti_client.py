@@ -27,6 +27,15 @@ GROUP_ID = "seed-storage"
 
 _graphiti: Graphiti | None = None
 _loop_id: int | None = None
+_init_lock: asyncio.Lock | None = None
+
+
+def _get_init_lock() -> asyncio.Lock:
+    """Get or create the init lock for the current event loop."""
+    global _init_lock
+    if _init_lock is None:
+        _init_lock = asyncio.Lock()
+    return _init_lock
 
 
 def _build_llm_client():
@@ -77,40 +86,50 @@ async def get_graphiti() -> Graphiti:
     was created on, the old instance is closed and a new one is built.  This
     is necessary because Celery tasks call asyncio.run() per invocation,
     creating a fresh event loop each time.
+
+    Uses an asyncio.Lock to prevent concurrent callers from racing during
+    initialization (one task closing the driver while another is mid-query).
     """
-    global _graphiti, _loop_id
+    global _graphiti, _loop_id, _init_lock
     current_loop_id = id(asyncio.get_running_loop())
 
+    # Fast path — already initialized on this loop.
     if _graphiti is not None and _loop_id == current_loop_id:
         return _graphiti
 
-    # Close stale instance whose connections are on a dead loop
-    if _graphiti is not None:
-        logger.debug("graphiti: event loop changed, closing stale instance")
-        try:
-            await _graphiti.close()
-        except Exception:
-            pass
-        _graphiti = None
+    async with _get_init_lock():
+        # Re-check after acquiring lock (another task may have initialized).
+        if _graphiti is not None and _loop_id == current_loop_id:
+            return _graphiti
 
-    _graphiti = Graphiti(
-        uri=settings.NEO4J_URI,
-        user=settings.NEO4J_USER,
-        password=settings.NEO4J_PASSWORD,
-        llm_client=_build_llm_client(),
-        embedder=_build_embedder(),
-    )
+        # Close stale instance whose connections are on a dead loop
+        if _graphiti is not None:
+            logger.debug("graphiti: event loop changed, closing stale instance")
+            try:
+                await _graphiti.close()
+            except Exception:
+                pass
+            _graphiti = None
 
-    await _graphiti.build_indices_and_constraints()
-    _loop_id = current_loop_id
-    return _graphiti
+        _graphiti = Graphiti(
+            uri=settings.NEO4J_URI,
+            user=settings.NEO4J_USER,
+            password=settings.NEO4J_PASSWORD,
+            llm_client=_build_llm_client(),
+            embedder=_build_embedder(),
+        )
+        _loop_id = current_loop_id  # Set before build_indices so concurrent waiters see it
+
+        await _graphiti.build_indices_and_constraints()
+        return _graphiti
 
 
 def reset_graphiti() -> None:
     """Reset the singleton (used in tests)."""
-    global _graphiti, _loop_id
+    global _graphiti, _loop_id, _init_lock
     _graphiti = None
     _loop_id = None
+    _init_lock = None
 
 
 def get_vision_client() -> Any:
