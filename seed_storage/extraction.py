@@ -121,6 +121,23 @@ def _apply_coreference(text: str, alias_map: dict[str, str]) -> str:
     return text
 
 
+_ENTITY_TYPE_MAP = {
+    "Person": "Person", "Organization": "Organization", "Product": "Product",
+    "Concept": "Concept", "Location": "Location", "Event": "Event",
+    # Common LLM variants that aren't in our strict schema
+    "Company": "Organization", "Startup": "Organization", "Institution": "Organization",
+    "Tool": "Product", "Framework": "Product", "Library": "Product", "Software": "Product",
+    "Technology": "Product", "Platform": "Product", "Service": "Product",
+    "Place": "Location", "City": "Location", "Country": "Location",
+    "Topic": "Concept", "Idea": "Concept", "Method": "Concept", "Theory": "Concept",
+}
+
+
+def _normalize_entity_type(raw_type: str) -> str:
+    """Map LLM entity type to our canonical EntityType, defaulting to Concept."""
+    return _ENTITY_TYPE_MAP.get(raw_type, "Concept")
+
+
 def _parse_extraction(raw: dict, model_used: str, input_tokens: int,
                       output_tokens: int) -> ExtractionResult:
     """Parse LLM structured output into ExtractionResult."""
@@ -130,7 +147,7 @@ def _parse_extraction(raw: dict, model_used: str, input_tokens: int,
         entities.append(ExtractedEntity(
             name=e["name"],
             canonical_name=canonical,
-            entity_type=e.get("entity_type", "Concept"),
+            entity_type=_normalize_entity_type(e.get("entity_type", "Concept")),
             description=e.get("description", ""),
             aliases=e.get("aliases", []),
         ))
