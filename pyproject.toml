@@ -1,14 +1,13 @@
 [project]
 name = "seed-storage"
 version = "0.2.0"
-description = "CruseControl knowledge graph — Discord to Neo4j via Graphiti"
+description = "CruseControl knowledge graph — Discord to Neo4j"
 requires-python = ">=3.12"
 dependencies = [
     # Configuration
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     # Graph / LLM
-    "graphiti-core>=0.3",
     "neo4j>=5.0",
     "openai>=1.0",
     # HTTP

@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 REACTIONS_CHANNEL = "seed:reactions"
-GROUP_ID = "seed-storage"
+GROUP_ID = "ant-haul"
 
 # URL regex for extracting links from message content.
 # Matches http:// and https:// URLs (greedy until whitespace or common terminators).
@@ -245,6 +245,10 @@ def enrich_message(self, raw_payload: dict) -> None:
             "resolved_contents": [rc.to_dict() for rc in resolved_contents],
         }
 
+        # Persist resolved content to Postgres staging before Celery handoff.
+        # This ensures the data is durable and replayable even if ingest_episode fails.
+        _persist_to_staging(raw_payload, resolved_contents)
+
         # Enqueue for graph ingest
         ingest_episode.delay(enriched_payload)
 
@@ -288,6 +292,54 @@ async def _resolve_urls(dispatcher: ContentDispatcher, urls: list[str]) -> list[
     return list(await _asyncio.gather(*tasks))
 
 
+def _persist_to_staging(raw_payload: dict, resolved_contents: list[ResolvedContent]) -> None:
+    """Persist message + resolved content to Postgres staging.
+
+    Stages the original message (if not already staged) and each resolved
+    content item as separate staging rows. This makes the data durable --
+    even if ingest_episode fails, the content can be replayed from Postgres.
+    """
+    from seed_storage import staging
+
+    source_type = raw_payload.get("source_type", "unknown")
+    source_id = raw_payload.get("source_id", "")
+    source_channel = raw_payload.get("source_channel", "unknown")
+    author = raw_payload.get("author", "")
+    content = raw_payload.get("content", "") or ""
+    timestamp = raw_payload.get("timestamp", "")
+
+    # Stage the message itself (dedup by source_uri)
+    msg_uri = f"discord://{source_channel}/{source_id}"
+    staging.stage(
+        source_type=source_type,
+        source_uri=msg_uri,
+        raw_content=content,
+        author=author,
+        channel=source_channel,
+        created_at=timestamp,
+        metadata={"discord_context": content[:200]},
+    )
+
+    # Stage each resolved content item
+    for rc in resolved_contents:
+        if not rc.text and not rc.transcript and not rc.summary:
+            continue
+        text = rc.text or rc.transcript or rc.summary or ""
+        staging.stage(
+            source_type=rc.content_type,
+            source_uri=rc.source_url,
+            raw_content=text,
+            author=author,
+            channel=source_channel,
+            created_at=timestamp,
+            metadata={
+                "title": rc.title,
+                "expansion_urls": rc.expansion_urls[:10],
+                "discord_context": content[:200],
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Task: ingest_episode
 # ---------------------------------------------------------------------------
@@ -303,23 +355,16 @@ async def _resolve_urls(dispatcher: ContentDispatcher, urls: list[str]) -> list[
     reject_on_worker_lost=True,
 )
 def ingest_episode(self, enriched_payload: dict) -> None:
-    """Write message + resolved contents to Graphiti.
+    """Extract entities from enriched payload and load into Neo4j.
 
+    Uses the new extraction + resolution + graph.py pipeline (no Graphiti).
     Steps:
-      1. Check cost budget — if exceeded, sleep and retry.
-      2. Check rate limiter — if over limit, retry with backoff.
-      3. Check circuit breaker — if open, skip and alert.
-      4. Write message episode via add_episode(group_id="seed-storage").
-      5. For each resolved content: write content episode.
-      6. Track cost per add_episode() call.
-      7. For each resolved content's expansion_urls: add_to_frontier().
-      8. Publish 🏷️ reaction (entities tagged) and 🧠 reaction (graph updated).
-
-    source_description formats (spec Section 4):
-      - message:  "{source_type.title()} #{source_channel}"
-      - content:  "content_from_{source_type.title()}_{source_channel}:{content_type}"
-
-    Anti-fallback rule: if add_episode() fails, do NOT fall back to Cypher.
+      1. Check cost budget / circuit breaker.
+      2. Find the staging row (persisted by _persist_to_staging in enrich_message).
+      3. Run extraction (if not already extracted).
+      4. Run loader to resolve entities and write to Neo4j.
+      5. Add expansion_urls to frontier.
+      6. Publish reactions.
     """
     message = enriched_payload.get("message", {})
     resolved_contents_raw = enriched_payload.get("resolved_contents", [])
@@ -328,16 +373,12 @@ def ingest_episode(self, enriched_payload: dict) -> None:
     source_id = message.get("source_id", "")
     source_channel = message.get("source_channel", "unknown")
     channel_id = message.get("metadata", {}).get("channel_id", "")
-    content = message.get("content", "") or ""
-    timestamp_str = message.get("timestamp", "")
 
     try:
         r = _get_redis()
         cost_tracker = _get_cost_tracker(r)
-        rate_limiter = _get_rate_limiter(r)
         circuit_breaker = _get_circuit_breaker(r)
 
-        # 1. Budget check
         if cost_tracker.is_budget_exceeded():
             logger.warning("ingest_episode: daily budget exceeded, retrying later")
             send_alert(
@@ -345,236 +386,96 @@ def ingest_episode(self, enriched_payload: dict) -> None:
                 debounce_key="budget_exceeded",
             )
             try:
-                raise self.retry(countdown=300)  # 5-minute backoff
+                raise self.retry(countdown=300)
             except self.MaxRetriesExceededError:
-                dead_letter(
-                    "ingest_episode",
-                    enriched_payload,
-                    Exception("budget_exceeded"),
-                    self.request.retries,
-                )
+                dead_letter("ingest_episode", enriched_payload, Exception("budget_exceeded"), self.request.retries)
                 return
 
-        # 2. Rate limit check
-        if not rate_limiter.allow():
-            logger.warning("ingest_episode: rate limit reached, retrying")
-            try:
-                raise self.retry(countdown=10)
-            except self.MaxRetriesExceededError:
-                dead_letter(
-                    "ingest_episode",
-                    enriched_payload,
-                    Exception("rate_limit_exceeded"),
-                    self.request.retries,
-                )
-                return
-
-        # 3. Circuit breaker check
         if circuit_breaker.is_open():
-            logger.warning("ingest_episode: circuit breaker open for graphiti, skipping")
-            send_alert(
-                "Graphiti circuit breaker is open — ingest episode skipped.",
-                debounce_key="circuit_open_graphiti",
-            )
+            logger.warning("ingest_episode: circuit breaker open, skipping")
             return
 
-        # 4. Build episode body
-        episode_body = content
-        if not episode_body:
-            for rc_dict in resolved_contents_raw:
-                if rc_dict.get("text"):
-                    episode_body = rc_dict["text"][:500]
-                    break
+        # Find the staging row persisted by _persist_to_staging
+        from seed_storage import staging as _staging
+        msg_uri = f"discord://{source_channel}/{source_id}"
+        item = _staging.get_by_uri(msg_uri)
 
-        source_desc_msg = _source_description_message(source_type, source_channel)
-        dedup_ingested = _get_dedup_ingested(r)
+        if item and item["status"] in ("staged", "processed", "enriched"):
+            # Run extraction
+            from seed_storage.extraction import extract_one
+            from seed_storage.preseed import get_alias_map, init_preseed_table
+            init_preseed_table()
+            alias_map = get_alias_map()
+            result = extract_one(item, alias_map=alias_map)
+            _staging.patch_metadata(str(item["id"]), {
+                "extraction": {
+                    **result.model_dump(),
+                    "extracted_at": datetime.now(tz=UTC).isoformat(),
+                },
+            })
+            _staging.update_status([str(item["id"])], "extracted")
 
-        # 5. Prepare content episodes (dedup synchronously before any async work)
-        all_rcs = [ResolvedContent.from_dict(rc_dict) for rc_dict in resolved_contents_raw]
-        content_episode_list: list[dict] = []
-        for rc in all_rcs:
-            content_text = rc.text or rc.summary or rc.transcript or ""
-            if not content_text:
-                logger.debug(
-                    "ingest_episode: no text for %s, skipping content episode", rc.source_url
-                )
-                continue
-            h = url_hash(rc.source_url)
-            if dedup_ingested.seen_or_mark(h):
-                logger.debug("ingest_episode: already ingested %s", rc.source_url)
-                continue
-            source_desc_content = _source_description_content(
-                source_type, source_channel, rc.content_type
-            )
-            content_episode_list.append(
-                {
-                    "name": f"content_{source_type}_{rc.source_url[:60]}",
-                    "episode_body": content_text,
-                    "source_description": source_desc_content,
-                    "reference_time": rc.resolved_at,
-                    "source_id": rc.source_url,
-                }
-            )
+            # Run load
+            asyncio.run(_load_item_to_graph(item, alias_map))
 
-        planned_count = 1 + len(content_episode_list)
-
-        # 6. Write ALL episodes in a single asyncio.run() — avoids the Neo4j driver
-        #    "pending task in closed loop" error caused by multiple asyncio.run() calls
-        #    sharing the same Graphiti singleton (which holds event-loop-bound connections).
-        try:
-            asyncio.run(
-                _write_all_episodes(
-                    message_name=f"{source_type}_{source_id}",
-                    episode_body=episode_body,
-                    source_desc_msg=source_desc_msg,
-                    reference_time=_parse_timestamp(timestamp_str),
-                    message_source_id=source_id,
-                    content_episode_list=content_episode_list,
-                )
-            )
-            for _ in range(planned_count):
-                cost_tracker.increment()
+            cost_tracker.increment()
             circuit_breaker.record_success()
-        except Exception as exc:  # noqa: BLE001
-            circuit_breaker.record_failure()
-            logger.error(
-                "ingest_episode: add_episode failed for message %s: %s",
-                source_id,
-                exc,
-                exc_info=True,
-            )
-            try:
-                raise self.retry(exc=exc)
-            except self.MaxRetriesExceededError:
-                dead_letter("ingest_episode", enriched_payload, exc, self.request.retries)
-                return
+        elif item and item["status"] == "extracted":
+            # Already extracted, just load
+            from seed_storage.preseed import get_alias_map, init_preseed_table
+            init_preseed_table()
+            alias_map = get_alias_map()
+            asyncio.run(_load_item_to_graph(item, alias_map))
+            cost_tracker.increment()
+            circuit_breaker.record_success()
 
-        # 7. Add expansion_urls to frontier (from ALL resolved contents, not just text-bearing)
+        # Add expansion_urls to frontier
+        all_rcs = [ResolvedContent.from_dict(rc_dict) for rc_dict in resolved_contents_raw]
         for rc in all_rcs:
             depth = int(message.get("metadata", {}).get("frontier_depth", 0))
             child_depth = depth + 1
-
             if child_depth > settings.HARD_DEPTH_CEILING:
-                logger.debug(
-                    "ingest_episode: depth ceiling %d reached, not expanding %s",
-                    settings.HARD_DEPTH_CEILING,
-                    rc.source_url,
-                )
                 continue
-
             expansion_urls = rc.expansion_urls[: settings.MAX_EXPANSION_BREADTH]
             for exp_url in expansion_urls:
                 h = url_hash(exp_url)
                 domain = _get_domain(exp_url)
                 priority = compute_priority(
-                    depth=child_depth,
-                    resolver_hint="unknown",
-                    domain=domain,
-                    source_channel=source_channel,
+                    depth=child_depth, resolver_hint="unknown",
+                    domain=domain, source_channel=source_channel,
                 )
-                discovered_at = datetime.now(tz=UTC).isoformat()
                 meta = {
-                    "url": exp_url,
-                    "url_hash": h,
+                    "url": exp_url, "url_hash": h,
                     "discovered_from_url": rc.source_url,
                     "discovered_from_source_id": source_id,
                     "source_channel": source_channel,
-                    "depth": child_depth,
-                    "resolver_hint": "unknown",
-                    "discovered_at": discovered_at,
+                    "depth": child_depth, "resolver_hint": "unknown",
+                    "discovered_at": datetime.now(tz=UTC).isoformat(),
                 }
                 try:
                     add_to_frontier(r, h, priority, meta)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("ingest_episode: failed to add %s to frontier: %s", exp_url, exc)
 
-        # 8. Publish reactions
         _publish_reaction(r, source_id, channel_id, "🏷️")
         _publish_reaction(r, source_id, channel_id, "🧠")
 
-        logger.info(
-            "ingest_episode: completed source_id=%s contents=%d",
-            source_id,
-            len(resolved_contents_raw),
-        )
+        logger.info("ingest_episode: completed source_id=%s", source_id)
 
     except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "ingest_episode: unhandled error source_id=%s: %s", source_id, exc, exc_info=True
-        )
+        logger.error("ingest_episode: failed source_id=%s: %s", source_id, exc, exc_info=True)
         try:
             raise self.retry(exc=exc)
         except self.MaxRetriesExceededError:
             dead_letter("ingest_episode", enriched_payload, exc, self.request.retries)
 
 
-async def _get_graphiti_instance():
-    """Get Graphiti singleton (async)."""
-    from seed_storage.graphiti_client import get_graphiti
-
-    return await get_graphiti()
-
-
-async def _add_episode(
-    graphiti,
-    name: str,
-    episode_body: str,
-    source_description: str,
-    reference_time: datetime,
-    source_id: str,
-) -> None:
-    """Call graphiti.add_episode() with group_id='seed-storage'."""
-    from graphiti_core.nodes import EpisodeType
-
-    await graphiti.add_episode(
-        name=name,
-        episode_body=episode_body,
-        source_description=source_description,
-        reference_time=reference_time,
-        source=EpisodeType.text,
-        group_id=GROUP_ID,
-    )
-
-
-async def _write_all_episodes(
-    *,
-    message_name: str,
-    episode_body: str,
-    source_desc_msg: str,
-    reference_time: datetime,
-    message_source_id: str,
-    content_episode_list: list[dict],
-) -> None:
-    """Write message + content episodes in a single event loop.
-
-    All Graphiti / Neo4j async calls share one event loop, avoiding the
-    "Task pending in closed loop" error that arises from multiple asyncio.run()
-    calls reusing the same Graphiti singleton.
-
-    Raises on message episode failure (caller retries the task).
-    Logs and continues for individual content episode failures.
-    """
-    graphiti = await _get_graphiti_instance()
-
-    await _add_episode(
-        graphiti,
-        name=message_name,
-        episode_body=episode_body,
-        source_description=source_desc_msg,
-        reference_time=reference_time,
-        source_id=message_source_id,
-    )
-
-    for args in content_episode_list:
-        try:
-            await _add_episode(graphiti, **args)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "_write_all_episodes: content episode failed for %s: %s",
-                args.get("source_id", "?"),
-                exc,
-                exc_info=True,
-            )
+async def _load_item_to_graph(item: dict, alias_map: dict) -> None:
+    """Load a single staging item into Neo4j (async helper for ingest_episode)."""
+    from seed_storage.graph import get_driver
+    from ingestion.loader import _load_one_item
+    driver = await get_driver()
+    await _load_one_item(item, alias_map, None, driver, batch_id=None)
 
 
 def _parse_timestamp(timestamp_str: str) -> datetime:
