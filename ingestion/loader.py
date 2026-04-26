@@ -201,6 +201,9 @@ def _build_enriched_content(content: str, metadata: dict) -> str:
         header_parts.append(f"Tags: {', '.join(tags)}")
     if summary:
         header_parts.append(f"Summary: {summary}")
+    discord_ctx = metadata.get("discord_context", "")
+    if discord_ctx:
+        header_parts.append(f"Shared with context: {discord_ctx}")
     if speakers:
         speaker_strs = []
         for s in speakers:
@@ -419,7 +422,18 @@ async def estimate():
 
 
 if __name__ == "__main__":
+    import os
     import sys
+    from pathlib import Path
+
+    # Load .env for local development (Graphiti needs OPENAI_API_KEY in os.environ).
+    _env = Path(__file__).resolve().parent.parent / ".env"
+    if _env.exists():
+        for _line in _env.read_text().splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 

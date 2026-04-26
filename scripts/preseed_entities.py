@@ -21,13 +21,14 @@ CORE_ENTITIES = [
     {
         "name": "Flynn Cruse",
         "type": "person",
-        "aliases": ["Flynn", "Flynn A. Cruse", "flynn-cruse", "flynncruse"],
+        "aliases": ["Flynn", "Flynn A. Cruse", "flynn-cruse", "flynncruse",
+                    "siliconwarlock", "silicon_warlock", "SiliconWarlock", "flynnbo"],
         "description": "Co-founder and CEO of CruseControl. Business strategy, sales, client relations.",
     },
     {
         "name": "Wyler Zahm",
         "type": "person",
-        "aliases": ["Wyler", "wyler-zahm", "siliconwarlock", "silicon_warlock", "SiliconWarlock"],
+        "aliases": ["Wyler", "wyler-zahm", "famed_esteemed", "wylerza", "Wyler Z"],
         "description": "Co-founder and CTO of CruseControl. AI engineering, infrastructure, agent systems.",
     },
     {

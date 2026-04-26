@@ -81,6 +81,16 @@ async def process_one(
     source_type = item["source_type"]
     source_uri = item["source_uri"]
 
+    # Preserve Discord commentary for URL entries — the processor replaces
+    # raw_content with extracted content, but the original message has context.
+    original_text = (item.get("raw_content") or "").strip()
+    has_discord_context = (
+        source_type not in ("plain_text", "conversation_thread", "discord_link", "media_link")
+        and original_text
+        and original_text != source_uri
+        and len(original_text) > len(source_uri) + 5
+    )
+
     try:
         if source_type == "instagram":
             content, meta = await _process_instagram(http, anthropic, analyzer_url, source_uri)
@@ -117,6 +127,12 @@ async def process_one(
             log.warning("Unknown source_type '%s' for %s", source_type, source_uri)
             content = item["raw_content"]
             meta = {}
+
+        # Stash Discord commentary in metadata so the loader can include it.
+        if has_discord_context:
+            commentary = original_text.replace(source_uri, "").strip()
+            if len(commentary) > 5:
+                meta["discord_context"] = commentary
 
         staging.update_content(item_id, content, metadata=meta, status="processed")
         log.info("Processed [%s] %s", source_type, source_uri)

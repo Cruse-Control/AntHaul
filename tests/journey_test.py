@@ -138,6 +138,12 @@ async def test_issue_10():
     uncategorized = _build_enriched_content(content, {"tags": ["uncategorized"]})
     _assert("Tags:" not in uncategorized, "Uncategorized tags excluded from header")
 
+    # Test with discord_context (#4 source tagging)
+    ctx_meta = {"discord_context": "Check out this great ML overview"}
+    with_ctx = _build_enriched_content(content, ctx_meta)
+    _assert("Shared with context: Check out this great ML overview" in with_ctx,
+            "Discord context in enriched content")
+
 
 # ── #11: Instagram image resolver ─────────────────────────────────────
 
@@ -331,17 +337,19 @@ async def test_issue_14():
 
     # Verify aliases are set for key entities
     wyler = next(e for e in CORE_ENTITIES if e["name"] == "Wyler Zahm")
-    _assert("siliconwarlock" in wyler["aliases"], "siliconwarlock is a Wyler alias")
+    _assert("famed_esteemed" in wyler["aliases"], "famed_esteemed is a Wyler alias")
     _assert("wyler-zahm" in wyler["aliases"], "wyler-zahm is a Wyler alias")
 
     flynn = next(e for e in CORE_ENTITIES if e["name"] == "Flynn Cruse")
     _assert("flynn-cruse" in flynn["aliases"], "flynn-cruse is a Flynn alias")
+    _assert("siliconwarlock" in flynn["aliases"], "siliconwarlock is a Flynn alias")
+    _assert("flynnbo" in flynn["aliases"], "flynnbo is a Flynn alias")
 
     # Verify episode body format
     body = _build_episode_body(wyler)
     _assert("Entity: Wyler Zahm" in body, "Episode body has entity name")
     _assert("Type: person" in body, "Episode body has type")
-    _assert("siliconwarlock" in body, "Episode body includes aliases")
+    _assert("famed_esteemed" in body, "Episode body includes aliases")
     _assert("CTO" in body or "engineering" in body.lower(), "Episode body has description")
 
 
