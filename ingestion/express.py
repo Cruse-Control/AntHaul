@@ -1,6 +1,6 @@
-"""Express ingest — full pipeline for a single URL in one shot.
+"""Express ingest -- full pipeline for a single URL in one shot.
 
-Bypasses cron waits by running stage → process → enrich → load synchronously.
+Bypasses cron waits by running stage -> process -> enrich -> extract -> load synchronously.
 Typical latency: 5-15 seconds for a web article, longer for video content.
 
 Run as: python -m ingestion.express <url>
@@ -24,7 +24,7 @@ from ingestion.classifier import Platform, classify, clean_url
 from ingestion.enricher import _enrich_one, _get_existing_tags, _upsert_tags, init_tags_table
 from ingestion.processor import process_one
 from seed_storage import staging
-from seed_storage.graphiti_client import add_episode, close
+from seed_storage.graph import close
 
 log = logging.getLogger("express")
 
@@ -34,7 +34,7 @@ async def express_ingest(
     author: str = "express",
     channel: str = "express",
 ) -> dict:
-    """Full pipeline for a single URL: stage → process → enrich → load.
+    """Full pipeline for a single URL: stage -> process -> enrich -> extract -> load.
 
     Resumes from the item's current status if it already exists in staging.
     Returns dict with status, timing, and source_uri.
@@ -54,7 +54,6 @@ async def express_ingest(
     )
 
     if sid is None:
-        # Already exists — look up current status and resume
         item = staging.get_by_uri(url)
         if item is None:
             return {"status": "error", "message": "URL exists but could not be retrieved", "source_uri": url}
@@ -97,7 +96,6 @@ async def express_ingest(
                         continue
                     meta[key] = value
 
-                # Curator attribution
                 item_author = item.get("author", "unknown")
                 speakers = meta.get("speakers", [])
                 curator_names = {s["name"] for s in speakers if s.get("role") == "curator"}
@@ -110,30 +108,39 @@ async def express_ingest(
                 new_tags = enrichment.get("tags", [])
                 if new_tags:
                     _upsert_tags(new_tags)
-                log.info("Express enriched [%s] %s → tags=%s", item["source_type"], url, new_tags)
+                log.info("Express enriched [%s] %s -> tags=%s", item["source_type"], url, new_tags)
             else:
-                # No API key — skip enrichment, promote directly
                 staging.update_status([item_id], "enriched")
 
             item = staging.get_by_id(item_id)
             current_status = item["status"]
             await discord_touch.react(item, "enriched")
 
-        # 4. Load (if needed)
+        # 4. Extract (if needed)
         if current_status in ("enriched",):
-            content = item["raw_content"] or ""
-            source_type = item["source_type"]
-            item_channel = item.get("channel", "")
+            from seed_storage.extraction import extract_one
+            from seed_storage.preseed import get_alias_map, init_preseed_table
+            init_preseed_table()
+            result = extract_one(item, alias_map=get_alias_map())
+            staging.patch_metadata(item_id, {
+                "extraction": {
+                    **result.model_dump(),
+                    "extracted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            })
+            staging.update_status([item_id], "extracted")
+            item = staging.get_by_id(item_id)
+            current_status = "extracted"
 
-            await add_episode(
-                name=url,
-                content=content,
-                source="text",
-                source_description=f"{source_type} from #{item_channel}" if item_channel else source_type,
-                reference_time=item.get("created_at") or datetime.now(timezone.utc),
-            )
-            staging.update_status([item_id], "loaded")
-            log.info("Express loaded [%s] %s", source_type, url)
+        # 5. Load (if needed)
+        if current_status in ("extracted",):
+            from seed_storage.preseed import get_alias_map
+            from seed_storage.graph import get_driver
+            from ingestion.loader import _load_one_item
+
+            alias_map = get_alias_map()
+            driver = await get_driver()
+            await _load_one_item(item, alias_map, None, driver, batch_id=None)
             current_status = "loaded"
             await discord_touch.react(item, "loaded")
 
@@ -154,5 +161,5 @@ if __name__ == "__main__":
     result = asyncio.run(express_ingest(url))
     print(json.dumps(result, indent=2, default=str))
 
-    # Clean up Graphiti connection
+    # Clean up Neo4j connection
     asyncio.run(close())

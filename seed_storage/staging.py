@@ -300,3 +300,78 @@ def reset_orphaned_loading(timeout_hours: int = 1) -> int:
             count = cur.rowcount
         conn.commit()
     return count
+
+
+def reset_orphaned_extracting(timeout_hours: int = 1) -> int:
+    """Reset items stuck in 'extracting' status back to 'enriched'. Returns count."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE seed_staging SET status = 'enriched'
+                   WHERE status = 'extracting'
+                   AND staged_at < NOW() - INTERVAL '%s hours'
+                   RETURNING id""",
+                (timeout_hours,),
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+
+def reset_to_status(
+    target_status: str,
+    *,
+    source_statuses: list[str] | None = None,
+    batch_id: str | None = None,
+    limit: int | None = None,
+) -> int:
+    """Reset items from downstream statuses back to a target for replay.
+
+    Args:
+        target_status: Status to reset TO (e.g. 'enriched').
+        source_statuses: Which statuses to reset FROM. If None, uses all
+            statuses downstream of target_status.
+        batch_id: Optional -- only reset items in this batch.
+        limit: Optional -- cap on how many items to reset.
+
+    Returns count of items reset.
+    """
+    DOWNSTREAM = {
+        "staged": ["processed", "enriched", "extracted", "loaded"],
+        "processed": ["enriched", "extracted", "loaded"],
+        "enriched": ["extracted", "loaded"],
+        "extracted": ["loaded"],
+    }
+
+    if source_statuses is None:
+        source_statuses = DOWNSTREAM.get(target_status)
+        if source_statuses is None:
+            raise ValueError(f"No downstream statuses for '{target_status}'")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            if limit:
+                batch_filter = "AND batch_id = %s::uuid" if batch_id else ""
+                query = f"""
+                    UPDATE seed_staging SET status = %s
+                    WHERE id IN (
+                        SELECT id FROM seed_staging
+                        WHERE status = ANY(%s)
+                        {batch_filter}
+                        ORDER BY staged_at LIMIT %s
+                    )
+                """
+                params: list = [target_status, source_statuses]
+                if batch_id:
+                    params.append(batch_id)
+                params.append(limit)
+            else:
+                query = "UPDATE seed_staging SET status = %s WHERE status = ANY(%s)"
+                params = [target_status, source_statuses]
+                if batch_id:
+                    query += " AND batch_id = %s::uuid"
+                    params.append(batch_id)
+            cur.execute(query, params)
+            count = cur.rowcount
+        conn.commit()
+    return count

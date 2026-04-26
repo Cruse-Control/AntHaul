@@ -2,7 +2,7 @@
 
 ## System overview
 
-Seed Storage is a Discord-first knowledge graph pipeline. It ingests Discord messages and linked content, extracts named entities and facts via LLM, and stores everything in Neo4j via Graphiti for semantic search.
+AntHaul (seed-storage) is a Discord-first knowledge graph pipeline. It ingests Discord messages and linked content, extracts typed entities via LLM structured output, resolves duplicates with 3-tier entity resolution, and stores everything in Neo4j with dual-label nodes and vector indices for semantic search.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -44,16 +44,20 @@ Seed Storage is a Discord-first knowledge graph pipeline. It ingests Discord mes
 │                                                                  │
 │                    ingest_episode task                           │
 │              budget check → rate limit → circuit breaker         │
-│                    → graphiti.add_episode()                      │
+│                    → extraction → resolution → graph.py          │
 │                    → expansion_urls → frontier                   │
 └───────────────────────┼─────────────────────────────────────────┘
                         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        GRAPH LAYER                               │
+│                    EXTRACTION + RESOLUTION                        │
 │                                                                  │
-│              Graphiti (graphiti_client.py)                       │
-│              LLM entity extraction + embedding                   │
+│  extraction.py — OpenAI structured output (1 LLM call/chunk)    │
+│  resolution.py — 3-tier entity dedup (canonical→embed→judge)    │
+│  preseed.py — known entities + aliases (Postgres)               │
 │                         │                                        │
+│                    GRAPH LAYER                                   │
+│              graph.py — typed dual-label entities                │
+│              (:Person:__Entity__), vector indices                │
 │                    Neo4j (K8s)                                   │
 │              Bolt :30687 / HTTP :30474                           │
 └─────────────────────────────────────────────────────────────────┘
@@ -126,27 +130,22 @@ All resolvers return `ResolvedContent`. On failure they return `ResolvedContent.
 
 `resolved_at` is stamped by the dispatcher (not the resolver) after resolution completes.
 
-### Graph writes
+### Entity extraction + graph writes
 
-**`get_graphiti()`** returns a singleton `Graphiti` instance, initializing on first call:
-1. Builds LLM client based on `LLM_PROVIDER` (openai/anthropic/groq)
-2. Builds embedder (always `OpenAIEmbedder` — `OPENAI_API_KEY` required regardless of provider)
-3. Calls `build_indices_and_constraints()` (idempotent)
+**Extraction** (`extraction.py`): Uses OpenAI structured output (`response_format` with `json_schema`) for deterministic entity extraction. One LLM call per content chunk. Per-source schemas control which entity types to prioritize. Coreference pre-processing replaces known aliases (from preseed) before sending to the LLM.
 
-**`ingest_episode` task** writes two kinds of episodes per message:
+**Resolution** (`resolution.py`): 3-tier entity deduplication:
+1. **Tier 1** — Canonical name normalization + preseed alias lookup (O(1))
+2. **Tier 2** — Embedding cosine similarity via Neo4j vector index (threshold 0.65)
+3. **Tier 3** — LLM-as-judge for the ambiguous 0.65-0.90 band (~5% of entities)
 
-| Episode type | `source_description` format | Example |
-|-------------|----------------------------|---------|
-| Message episode | `"{source_type.title()} #{source_channel}"` | `"Discord #general"` |
-| Content episode | `"content_from_{source_type.title()}_{source_channel}:{content_type}"` | `"content_from_Discord_general:youtube"` |
+**Graph writes** (`graph.py`): All entity nodes have dual labels `(:Person:__Entity__)`. MERGE by `canonical_name`. Relationships are typed (`WORKS_FOR`, `DISCUSSES`, etc.). Vector indices on 1536-dim embeddings (text-embedding-3-small).
 
-Note: content episodes use `_` (not `#`) before the channel name.
+**`ingest_episode` task**: Reads enriched payload, persists to Postgres staging, extracts entities via `extract_one()`, resolves via `resolve_entity()`, writes typed nodes via `graph.py`.
 
-All episodes in a single `ingest_episode` task execution are written in a single `asyncio.run()` call via `_write_all_episodes()`. This avoids the Neo4j async driver `Task pending in closed loop` error that results from multiple `asyncio.run()` calls sharing the same Graphiti singleton.
+`group_id` is always `"ant-haul"`. Never per-channel. All knowledge is in one unified graph.
 
-`group_id` is always `"seed-storage"`. Never per-channel. All knowledge is in one unified graph.
-
-**Anti-fallback rule:** If `add_episode()` fails, do NOT write direct Cypher. Report the failure. Graphiti's entity resolution is the core value.
+**Loader concurrency is 1** — entity resolution requires seeing the current graph state. Parallel writes cause merge races.
 
 ### Frontier expansion
 
@@ -218,17 +217,16 @@ Discord message
     │
     ├── ingest_episode (Celery task)
     │       check budget + rate limit + circuit breaker
-    │       add_episode(message, group_id="seed-storage")
-    │       for each resolved content:
-    │           dedup by ingested_content
-    │           add_episode(content, group_id="seed-storage")
+    │       extract entities (extraction.py, structured output)
+    │       resolve entities (resolution.py, 3-tier dedup)
+    │       write typed nodes (graph.py, dual-label entities)
     │       add expansion_urls to frontier
     │
-    └── Neo4j (via Graphiti)
-            Entity nodes (merged across episodes)
-            Episodic nodes
-            RELATES_TO edges between entities
-            MENTIONS edges from episodes to entities
+    └── Neo4j (via graph.py)
+            Typed entity nodes (:Person:__Entity__, :Concept:__Entity__, etc.)
+            Source nodes (provenance), Fact nodes, Tag nodes
+            Typed relationships (WORKS_FOR, DISCUSSES, CITES, etc.)
+            Vector indices (1536d cosine)
 ```
 
 ## Redis key namespaces
@@ -245,7 +243,7 @@ All keys on **DB 2** (`/2` suffix in `REDIS_URL`). Ant-keeper uses DB 0.
 | `seed:dead_letters` | LIST | Failed tasks (RPUSH/LPOP FIFO) |
 | `seed:circuit:{service}:*` | various | Circuit breaker state per service |
 | `seed:cost:daily:YYYY-MM-DD` | STRING | Daily LLM spend counter (TTL 48h) |
-| `seed:ratelimit:graphiti` | ZSET | Sliding window rate limiter |
+| `seed:ratelimit:extraction` | ZSET | Sliding window rate limiter |
 | `seed:reactions` | pubsub | Discord reaction events channel |
 | `seed:bot:connected` | STRING | Bot liveness flag (`1` = connected) |
 
@@ -304,4 +302,4 @@ Omitting this step causes deploy-time failure: `Credential '<name>' missing prox
 - Redis DB isolation: DB 2 for seed-storage, DB 0 for ant-keeper.
 - API keys masked in all log output by `_SecretMaskingFilter` in `config.py`.
 - Dead letter tracebacks sanitized before storage.
-- No SQL — Neo4j via Graphiti. No raw Cypher execution from user input.
+- No raw Cypher execution from user input. All graph writes through graph.py typed functions.

@@ -110,6 +110,14 @@ class Settings(BaseSettings):
     # --- Graphiti ---
     GROUP_ID: str = "seed-storage"
 
+    # --- Extraction pipeline ---
+    EXTRACTION_MODEL: str = "gpt-4o-mini"
+    ENRICHMENT_MODEL: str = "gpt-4o-mini"
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_DIM: int = 1536
+    ENTITY_SIMILARITY_THRESHOLD: float = 0.65
+    ENTITY_AMBIGUOUS_THRESHOLD: float = 0.90
+
     # --- PostgreSQL (v1 staging table, shared with ant-keeper) ---
     PG_DSN: str = "postgresql://taskman:postgres@127.0.0.1:30433/task_manager"
 
@@ -248,6 +256,9 @@ NEO4J_PASSWORD = settings.NEO4J_PASSWORD
 BATCH_COST_CEILING_USD: float = 2.00
 CIRCUIT_BREAKER_THRESHOLD: int = 5
 TINY_CONTENT_CHARS: int = 20
+BATCH_SIZE_DEFAULT: int = 200
+EXTRACTION_CONCURRENCY: int = 3
+LOADER_CONCURRENCY: int = 1
 
 # Discord ops channel for alerts (empty = alerts disabled)
 DISCORD_OPS_ALERTS_CHANNEL: str = ""

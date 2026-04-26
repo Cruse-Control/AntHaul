@@ -1,5 +1,10 @@
-"""Neo4j client wrapper for seed-storage."""
+"""Neo4j graph client -- typed dual-label entities, vector indices, semantic relationships.
 
+All entity nodes carry the __Entity__ base label plus a type-specific label:
+  (:Person:__Entity__), (:Organization:__Entity__), (:Concept:__Entity__), etc.
+
+Vector indices use text-embedding-3-small (1536 dims).
+"""
 from __future__ import annotations
 
 import uuid
@@ -9,7 +14,6 @@ from typing import Any
 from neo4j import AsyncGraphDatabase, AsyncDriver
 
 from . import config
-
 
 _driver: AsyncDriver | None = None
 
@@ -39,7 +43,9 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
-# ── Schema initialization ──────────────────────────────────────────
+# -- Schema initialization --
+
+EMBEDDING_DIM = config.settings.EMBEDDING_DIM  # 1536
 
 
 async def init_schema():
@@ -47,86 +53,131 @@ async def init_schema():
     driver = await get_driver()
 
     constraints = [
-        # Layer 1: Epistemic (existing)
+        "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:__Entity__) REQUIRE e.id IS UNIQUE",
+        "CREATE CONSTRAINT entity_canonical IF NOT EXISTS FOR (e:__Entity__) REQUIRE e.canonical_name IS UNIQUE",
         "CREATE CONSTRAINT source_id IF NOT EXISTS FOR (s:Source) REQUIRE s.id IS UNIQUE",
         "CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (f:Fact) REQUIRE f.id IS UNIQUE",
-        "CREATE CONSTRAINT concept_id IF NOT EXISTS FOR (c:Concept) REQUIRE c.id IS UNIQUE",
-        "CREATE CONSTRAINT theme_id IF NOT EXISTS FOR (t:Theme) REQUIRE t.id IS UNIQUE",
-        "CREATE CONSTRAINT domain_id IF NOT EXISTS FOR (d:Domain) REQUIRE d.id IS UNIQUE",
-        "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
-        "CREATE CONSTRAINT question_id IF NOT EXISTS FOR (q:Question) REQUIRE q.id IS UNIQUE",
-        "CREATE CONSTRAINT gap_id IF NOT EXISTS FOR (g:Gap) REQUIRE g.id IS UNIQUE",
-        "CREATE CONSTRAINT community_id IF NOT EXISTS FOR (c:Community) REQUIRE c.id IS UNIQUE",
-        # Layer 2: Reasoning (PRD — Person→Decision→Context→Outcome, MentalModel)
-        "CREATE CONSTRAINT decision_id IF NOT EXISTS FOR (d:Decision) REQUIRE d.id IS UNIQUE",
-        "CREATE CONSTRAINT context_id IF NOT EXISTS FOR (c:Context) REQUIRE c.id IS UNIQUE",
-        "CREATE CONSTRAINT outcome_id IF NOT EXISTS FOR (o:Outcome) REQUIRE o.id IS UNIQUE",
-        "CREATE CONSTRAINT mentalmodel_id IF NOT EXISTS FOR (m:MentalModel) REQUIRE m.id IS UNIQUE",
-        # Layer 3: Operational (PRD — Agent→Skill→Output→Review)
-        "CREATE CONSTRAINT review_id IF NOT EXISTS FOR (r:Review) REQUIRE r.id IS UNIQUE",
-        # Enrichment: dynamic tags
+        "CREATE CONSTRAINT community_id IF NOT EXISTS FOR (c:__Community__) REQUIRE c.id IS UNIQUE",
         "CREATE CONSTRAINT tag_name IF NOT EXISTS FOR (t:Tag) REQUIRE t.name IS UNIQUE",
     ]
 
     vector_indexes = [
-        """CREATE VECTOR INDEX source_embedding IF NOT EXISTS
-           FOR (s:Source) ON (s.embedding)
-           OPTIONS {indexConfig: {
-             `vector.dimensions`: 3072,
+        f"""CREATE VECTOR INDEX entity_embedding IF NOT EXISTS
+           FOR (n:__Entity__) ON (n.embedding)
+           OPTIONS {{indexConfig: {{
+             `vector.dimensions`: {EMBEDDING_DIM},
              `vector.similarity_function`: 'cosine'
-           }}""",
-        """CREATE VECTOR INDEX fact_embedding IF NOT EXISTS
+           }}}}""",
+        f"""CREATE VECTOR INDEX fact_embedding IF NOT EXISTS
            FOR (f:Fact) ON (f.embedding)
-           OPTIONS {indexConfig: {
-             `vector.dimensions`: 3072,
+           OPTIONS {{indexConfig: {{
+             `vector.dimensions`: {EMBEDDING_DIM},
              `vector.similarity_function`: 'cosine'
-           }}""",
-        """CREATE VECTOR INDEX concept_embedding IF NOT EXISTS
-           FOR (c:Concept) ON (c.embedding)
-           OPTIONS {indexConfig: {
-             `vector.dimensions`: 3072,
+           }}}}""",
+        f"""CREATE VECTOR INDEX source_embedding IF NOT EXISTS
+           FOR (s:Source) ON (s.embedding)
+           OPTIONS {{indexConfig: {{
+             `vector.dimensions`: {EMBEDDING_DIM},
              `vector.similarity_function`: 'cosine'
-           }}""",
-        """CREATE VECTOR INDEX question_embedding IF NOT EXISTS
-           FOR (q:Question) ON (q.embedding)
-           OPTIONS {indexConfig: {
-             `vector.dimensions`: 3072,
-             `vector.similarity_function`: 'cosine'
-           }}""",
-        """CREATE VECTOR INDEX entity_embedding IF NOT EXISTS
-           FOR (e:Entity) ON (e.embedding)
-           OPTIONS {indexConfig: {
-             `vector.dimensions`: 3072,
-             `vector.similarity_function`: 'cosine'
-           }}""",
+           }}}}""",
     ]
 
     lookup_indexes = [
         "CREATE INDEX source_uri IF NOT EXISTS FOR (s:Source) ON (s.source_uri)",
         "CREATE INDEX source_type IF NOT EXISTS FOR (s:Source) ON (s.type)",
-        "CREATE INDEX fact_realm IF NOT EXISTS FOR (f:Fact) ON (f.realm)",
-        "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
-        "CREATE INDEX question_status IF NOT EXISTS FOR (q:Question) ON (q.status)",
-        "CREATE INDEX concept_name IF NOT EXISTS FOR (c:Concept) ON (c.name)",
-        # Reasoning layer indexes
-        "CREATE INDEX decision_title IF NOT EXISTS FOR (d:Decision) ON (d.title)",
-        "CREATE INDEX mentalmodel_name IF NOT EXISTS FOR (m:MentalModel) ON (m.name)",
+        "CREATE INDEX entity_name IF NOT EXISTS FOR (e:__Entity__) ON (e.name)",
+        "CREATE INDEX entity_type IF NOT EXISTS FOR (e:__Entity__) ON (e.entity_type)",
         "CREATE INDEX tag_name_idx IF NOT EXISTS FOR (t:Tag) ON (t.name)",
     ]
 
     fulltext_indexes = [
-        """CREATE FULLTEXT INDEX source_content IF NOT EXISTS
-           FOR (s:Source) ON EACH [s.raw_content]""",
+        """CREATE FULLTEXT INDEX entity_name_fulltext IF NOT EXISTS
+           FOR (n:__Entity__) ON EACH [n.name, n.description]""",
         """CREATE FULLTEXT INDEX fact_statement IF NOT EXISTS
            FOR (f:Fact) ON EACH [f.statement]""",
+        """CREATE FULLTEXT INDEX source_content IF NOT EXISTS
+           FOR (s:Source) ON EACH [s.raw_content]""",
     ]
 
     async with driver.session() as session:
         for stmt in constraints + vector_indexes + lookup_indexes + fulltext_indexes:
-            await session.run(stmt)
+            try:
+                await session.run(stmt)
+            except Exception:
+                pass  # Index/constraint may already exist with different config
 
 
-# ── Write operations ───────────────────────────────────────────────
+# -- Entity operations (dual-label) --
+
+VALID_ENTITY_TYPES = {
+    "Person", "Organization", "Product", "Concept",
+    "Location", "Event", "Decision", "MentalModel",
+}
+
+
+async def upsert_entity(
+    *,
+    canonical_name: str,
+    name: str,
+    entity_type: str,
+    description: str = "",
+    embedding: list[float],
+    aliases: list[str] | None = None,
+    group_id: str = "ant-haul",
+) -> str:
+    """Create or merge an entity node with dual labels.
+
+    Uses MERGE on canonical_name. On create, sets both __Entity__ and type label.
+    On match, updates description (keep longer) and appends aliases.
+    Returns the entity node id.
+    """
+    driver = await get_driver()
+    entity_id = _uuid()
+    now = _now()
+
+    async with driver.session() as session:
+        result = await session.run(
+            """
+            MERGE (e:__Entity__ {canonical_name: $canonical_name})
+            ON CREATE SET
+                e.id = $id,
+                e.name = $name,
+                e.entity_type = $entity_type,
+                e.description = $description,
+                e.embedding = $embedding,
+                e.aliases = $aliases,
+                e.group_id = $group_id,
+                e.created_at = $now,
+                e.updated_at = $now
+            ON MATCH SET
+                e.description = CASE WHEN size(e.description) < size($description)
+                                     THEN $description ELSE e.description END,
+                e.aliases = [x IN (coalesce(e.aliases, []) + $aliases) WHERE x IS NOT NULL | x],
+                e.embedding = $embedding,
+                e.updated_at = $now
+            RETURN e.id AS id
+            """,
+            id=entity_id,
+            canonical_name=canonical_name,
+            name=name,
+            entity_type=entity_type,
+            description=description,
+            embedding=embedding,
+            aliases=aliases or [],
+            group_id=group_id,
+            now=now,
+        )
+        record = await result.single()
+        node_id = record["id"]
+
+        # Set type-specific label (idempotent)
+        if entity_type in VALID_ENTITY_TYPES:
+            await session.run(
+                f"MATCH (e:__Entity__ {{id: $id}}) SET e:{entity_type}",
+                id=node_id,
+            )
+
+    return node_id
 
 
 async def create_source(
@@ -134,15 +185,13 @@ async def create_source(
     source_type: str,
     source_uri: str,
     raw_content: str,
-    media_type: str = "text",
     embedding: list[float],
     author: str,
     created_at: str | None = None,
     channel: str = "",
-    confidence: float = 1.0,
-    metadata: dict | None = None,
+    group_id: str = "ant-haul",
 ) -> str:
-    """Create a Source node. Returns the node id."""
+    """Create a Source node (provenance). Returns node id."""
     driver = await get_driver()
     node_id = _uuid()
     now = _now()
@@ -150,33 +199,29 @@ async def create_source(
     async with driver.session() as session:
         await session.run(
             """
-            CREATE (s:Source {
-                id: $id,
-                type: $type,
-                source_uri: $source_uri,
-                raw_content: $raw_content,
-                media_type: $media_type,
-                embedding: $embedding,
-                author: $author,
-                created_at: $created_at,
-                ingested_at: $ingested_at,
-                channel: $channel,
-                confidence: $confidence,
-                metadata: $metadata
-            })
+            MERGE (s:Source {source_uri: $source_uri})
+            ON CREATE SET
+                s.id = $id,
+                s.type = $type,
+                s.raw_content = $raw_content,
+                s.embedding = $embedding,
+                s.author = $author,
+                s.created_at = $created_at,
+                s.ingested_at = $ingested_at,
+                s.channel = $channel,
+                s.group_id = $group_id
+            RETURN s.id AS id
             """,
             id=node_id,
             type=source_type,
             source_uri=source_uri,
-            raw_content=raw_content,
-            media_type=media_type,
+            raw_content=raw_content[:5000],
             embedding=embedding,
             author=author,
             created_at=created_at or now,
             ingested_at=now,
             channel=channel,
-            confidence=confidence,
-            metadata=str(metadata or {}),
+            group_id=group_id,
         )
     return node_id
 
@@ -185,12 +230,11 @@ async def create_fact(
     *,
     statement: str,
     embedding: list[float],
-    confidence: float = 0.8,
-    realm: str = "known_known",
     source_id: str,
-    extraction_method: str = "claude",
+    confidence: float = 0.8,
+    group_id: str = "ant-haul",
 ) -> str:
-    """Create a Fact node linked to its Source. Returns the fact id."""
+    """Create a Fact node linked to its Source. Returns fact id."""
     driver = await get_driver()
     fact_id = _uuid()
     now = _now()
@@ -204,68 +248,67 @@ async def create_fact(
                 statement: $statement,
                 embedding: $embedding,
                 confidence: $confidence,
-                verified: false,
                 extracted_at: $now,
-                last_validated: $now,
-                realm: $realm
+                group_id: $group_id
             })
-            CREATE (f)-[:EXTRACTED_FROM {method: $method}]->(s)
+            CREATE (f)-[:EXTRACTED_FROM]->(s)
             """,
             id=fact_id,
             statement=statement,
             embedding=embedding,
             confidence=confidence,
-            realm=realm,
             source_id=source_id,
             now=now,
-            method=extraction_method,
+            group_id=group_id,
         )
     return fact_id
 
 
-async def create_entity(
+ALLOWED_RELATIONSHIP_TYPES = {
+    "WORKS_FOR", "FOUNDED", "DISCUSSES", "CITES", "CREATED", "USES",
+    "PART_OF", "LOCATED_IN", "RELATED_TO", "SUPPORTS", "MENTIONS",
+    "HAS_TAG", "IN_COMMUNITY",
+}
+
+
+async def create_relationship(
     *,
-    name: str,
-    entity_type: str,
+    source_entity_id: str,
+    target_entity_id: str,
+    relationship_type: str,
     description: str = "",
-    embedding: list[float],
-) -> str:
-    """Create or merge an Entity node. Returns the entity id."""
+    confidence: float = 0.8,
+) -> None:
+    """Create a typed relationship between two entity nodes. Uses MERGE to avoid duplicates."""
     driver = await get_driver()
-    entity_id = _uuid()
+    if relationship_type not in ALLOWED_RELATIONSHIP_TYPES:
+        relationship_type = "RELATED_TO"
 
     async with driver.session() as session:
-        result = await session.run(
-            """
-            MERGE (e:Entity {name: $name})
-            ON CREATE SET
-                e.id = $id,
-                e.type = $type,
-                e.description = $description,
-                e.embedding = $embedding
-            ON MATCH SET
-                e.description = CASE WHEN size(e.description) < size($description)
-                                     THEN $description ELSE e.description END
-            RETURN e.id AS id
+        await session.run(
+            f"""
+            MATCH (a:__Entity__ {{id: $source_id}})
+            MATCH (b:__Entity__ {{id: $target_id}})
+            MERGE (a)-[r:{relationship_type}]->(b)
+            ON CREATE SET r.description = $description, r.confidence = $confidence,
+                          r.created_at = $now
             """,
-            id=entity_id,
-            name=name,
-            type=entity_type,
+            source_id=source_entity_id,
+            target_id=target_entity_id,
             description=description,
-            embedding=embedding,
+            confidence=confidence,
+            now=_now(),
         )
-        record = await result.single()
-        return record["id"]
 
 
 async def link_fact_entity(fact_id: str, entity_id: str):
-    """Create a MENTIONS relationship between a Fact and Entity."""
+    """Create a MENTIONS relationship between Fact and Entity."""
     driver = await get_driver()
     async with driver.session() as session:
         await session.run(
             """
             MATCH (f:Fact {id: $fact_id})
-            MATCH (e:Entity {id: $entity_id})
+            MATCH (e:__Entity__ {id: $entity_id})
             MERGE (f)-[:MENTIONS]->(e)
             """,
             fact_id=fact_id,
@@ -273,88 +316,61 @@ async def link_fact_entity(fact_id: str, entity_id: str):
         )
 
 
-# ── Read operations ────────────────────────────────────────────────
+async def link_source_tag(source_id: str, tag_name: str):
+    """Create a HAS_TAG relationship between Source and Tag (MERGE both)."""
+    driver = await get_driver()
+    async with driver.session() as session:
+        await session.run(
+            """
+            MATCH (s:Source {id: $source_id})
+            MERGE (t:Tag {name: $tag_name})
+            MERGE (s)-[:HAS_TAG]->(t)
+            """,
+            source_id=source_id,
+            tag_name=tag_name,
+        )
 
+
+# -- Read operations --
 
 async def vector_search(
     embedding: list[float],
-    label: str = "Fact",
+    index_name: str = "entity_embedding",
     limit: int = 10,
+    threshold: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Search nodes by vector similarity."""
     driver = await get_driver()
-    index_name = f"{label.lower()}_embedding"
-
     async with driver.session() as session:
         result = await session.run(
-            f"""
+            """
             CALL db.index.vector.queryNodes($index, $k, $embedding)
             YIELD node, score
-            RETURN node {{.*, embedding: null}} AS node, score
+            WHERE score >= $threshold
+            RETURN node {.*, embedding: null} AS node, score
             ORDER BY score DESC
             """,
             index=index_name,
             k=limit,
             embedding=embedding,
+            threshold=threshold,
         )
         return [{"node": r["node"], "score": r["score"]} async for r in result]
 
 
-async def vector_search_with_expansion(
-    embedding: list[float],
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """Vector search on Facts with graph expansion (provenance + concepts + entities)."""
-    driver = await get_driver()
-
-    async with driver.session() as session:
-        result = await session.run(
-            """
-            CALL db.index.vector.queryNodes('fact_embedding', $k, $embedding)
-            YIELD node AS fact, score
-
-            OPTIONAL MATCH (fact)-[:EXTRACTED_FROM]->(source:Source)
-            OPTIONAL MATCH (fact)-[:SUPPORTS]->(concept:Concept)
-            OPTIONAL MATCH (fact)-[:MENTIONS]->(entity:Entity)
-
-            RETURN
-                fact {.*, embedding: null} AS fact,
-                score,
-                source {.id, .type, .source_uri, .author, .created_at, .channel} AS source,
-                concept {.id, .name, .description, .maturity} AS concept,
-                collect(entity {.id, .name, .type}) AS entities
-            ORDER BY score DESC
-            """,
-            k=limit,
-            embedding=embedding,
-        )
-        return [
-            {
-                "fact": r["fact"],
-                "score": r["score"],
-                "source": r["source"],
-                "concept": r["concept"],
-                "entities": r["entities"],
-            }
-            async for r in result
-        ]
-
-
 async def fulltext_search(
     query: str,
-    label: str = "Fact",
+    index_name: str = "entity_name_fulltext",
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Full-text search on node content."""
     driver = await get_driver()
-    index_name = f"{label.lower()}_{'statement' if label == 'Fact' else 'content'}"
-
     async with driver.session() as session:
         result = await session.run(
-            f"""
+            """
             CALL db.index.fulltext.queryNodes($index, $search_query)
             YIELD node, score
-            RETURN node {{.*, embedding: null}} AS node, score
+            RETURN node {.*, embedding: null} AS node, score
             ORDER BY score DESC
             LIMIT $limit
             """,
@@ -363,6 +379,73 @@ async def fulltext_search(
             limit=limit,
         )
         return [{"node": r["node"], "score": r["score"]} async for r in result]
+
+
+async def hybrid_search(
+    query: str,
+    embedding: list[float],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Hybrid vector + fulltext search on entities. Deduplicates by node id."""
+    vector_results = await vector_search(embedding, limit=limit)
+    fulltext_results = await fulltext_search(query, limit=limit)
+
+    seen_ids = set()
+    combined = []
+    for r in vector_results + fulltext_results:
+        node_id = r["node"].get("id")
+        if node_id and node_id not in seen_ids:
+            seen_ids.add(node_id)
+            combined.append(r)
+    return sorted(combined, key=lambda x: x["score"], reverse=True)[:limit]
+
+
+async def get_entity_context(entity_id: str) -> dict:
+    """Get full context for an entity -- connected entities and relationships."""
+    driver = await get_driver()
+    async with driver.session() as session:
+        entity_result = await session.run(
+            "MATCH (e:__Entity__ {id: $id}) RETURN e {.*, embedding: null} AS entity",
+            id=entity_id,
+        )
+        entity_record = await entity_result.single()
+        if not entity_record:
+            return {"found": False}
+
+        out_result = await session.run(
+            """MATCH (e:__Entity__ {id: $id})-[r]->(m)
+               WHERE m:__Entity__ OR m:Fact
+               RETURN type(r) AS rel_type, r.description AS description,
+                      m {.*, embedding: null} AS target, labels(m) AS labels
+               LIMIT 50""",
+            id=entity_id,
+        )
+        outgoing = [
+            {"type": r["rel_type"], "description": r["description"],
+             "target": r["target"], "labels": r["labels"]}
+            async for r in out_result
+        ]
+
+        in_result = await session.run(
+            """MATCH (m)-[r]->(e:__Entity__ {id: $id})
+               WHERE m:__Entity__ OR m:Source OR m:Fact
+               RETURN type(r) AS rel_type, r.description AS description,
+                      m {.*, embedding: null} AS source, labels(m) AS labels
+               LIMIT 50""",
+            id=entity_id,
+        )
+        incoming = [
+            {"type": r["rel_type"], "description": r["description"],
+             "source": r["source"], "labels": r["labels"]}
+            async for r in in_result
+        ]
+
+        return {
+            "found": True,
+            "entity": entity_record["entity"],
+            "outgoing": outgoing,
+            "incoming": incoming,
+        }
 
 
 async def get_stats() -> dict:
