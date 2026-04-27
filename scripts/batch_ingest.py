@@ -616,7 +616,6 @@ async def run_batch_ingest(
                     entity_id_map[canonical] = node_id
 
             # Create relationships
-            rels_created = 0
             for rel in relationships:
                 src_canonical = normalize_name(rel.source, alias_map)
                 tgt_canonical = normalize_name(rel.target, alias_map)
@@ -629,15 +628,6 @@ async def run_batch_ingest(
                         relationship_type=rel.relationship_type,
                         description=rel.description,
                     )
-                    rels_created += 1
-                else:
-                    log.warning(
-                        "Relationship skipped: %s -[%s]-> %s (missing %s)",
-                        rel.source, rel.relationship_type, rel.target,
-                        "source" if not src_id else "target",
-                    )
-            log.info("Item %s: %d entities, %d/%d relationships written",
-                     item_id[:8], len(entities), rels_created, len(relationships))
 
             staging.update_status([item_id], "loaded")
             loaded += 1
