@@ -42,6 +42,10 @@ Thumbs.db
 # Whisper model cache (large, re-downloaded on build)
 ~/.cache/whisper/
 
+# Node (viz frontend)
+node_modules/
+viz/dist/
+
 # Celery
 celerybeat-schedule
 celerybeat.pid

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config, graph, embeddings
+
+_VIZ_DIST = Path(__file__).resolve().parent.parent / "viz" / "dist"
 
 
 @asynccontextmanager
@@ -20,6 +24,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Seed Storage", lifespan=lifespan)
+
+if _VIZ_DIST.is_dir():
+    app.mount("/viz", StaticFiles(directory=str(_VIZ_DIST), html=True), name="viz")
 
 
 # ── Models ─────────────────────────────────────────────────────────
@@ -132,6 +139,98 @@ async def query(req: QueryRequest):
 async def stats():
     """Graph statistics."""
     return await graph.get_stats()
+
+
+# ── Graph visualization endpoints ─────────────────────────────────
+
+
+@app.get("/api/graph/full")
+async def graph_full(limit: int = Query(50000, le=100000)):
+    """Return all entities and entity-to-entity relationships for viz."""
+    driver = await graph.get_driver()
+    async with driver.session() as session:
+        node_result = await session.run(
+            """
+            MATCH (e:__Entity__)
+            RETURN e.id AS id, e.name AS name, e.canonical_name AS canonical_name,
+                   e.entity_type AS entity_type, e.description AS description,
+                   e.aliases AS aliases, e.created_at AS created_at
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        nodes = [dict(r) async for r in node_result]
+
+        edge_result = await session.run(
+            """
+            MATCH (a:__Entity__)-[r]->(b:__Entity__)
+            RETURN a.id AS source, b.id AS target, type(r) AS type,
+                   r.description AS description, r.confidence AS confidence
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        edges = [dict(r) async for r in edge_result]
+
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/api/graph/neighborhood/{entity_id}")
+async def graph_neighborhood(entity_id: str, depth: int = Query(1, ge=1, le=3)):
+    """Return the N-hop neighborhood of an entity."""
+    driver = await graph.get_driver()
+    async with driver.session() as session:
+        result = await session.run(
+            """
+            MATCH (start:__Entity__ {id: $id})
+            CALL apoc.path.subgraphAll(start, {maxLevel: $depth,
+                 labelFilter: '__Entity__'})
+            YIELD nodes, relationships
+            UNWIND nodes AS n
+            WITH collect(DISTINCT {
+                id: n.id, name: n.name, canonical_name: n.canonical_name,
+                entity_type: n.entity_type, description: n.description,
+                aliases: n.aliases, created_at: n.created_at
+            }) AS nodeList, relationships
+            UNWIND relationships AS r
+            WITH nodeList, collect(DISTINCT {
+                source: startNode(r).id, target: endNode(r).id,
+                type: type(r), description: r.description,
+                confidence: r.confidence
+            }) AS edgeList
+            RETURN nodeList AS nodes, edgeList AS edges
+            """,
+            id=entity_id,
+            depth=depth,
+        )
+        record = await result.single()
+        if not record:
+            raise HTTPException(404, detail="Entity not found")
+        return {"nodes": record["nodes"], "edges": record["edges"]}
+
+
+@app.get("/api/graph/search")
+async def graph_search(
+    q: str = Query(..., min_length=1), limit: int = Query(20, le=100)
+):
+    """Search entities by name (fulltext)."""
+    driver = await graph.get_driver()
+    async with driver.session() as session:
+        result = await session.run(
+            """
+            CALL db.index.fulltext.queryNodes('entity_name_fulltext', $query)
+            YIELD node, score
+            RETURN node.id AS id, node.name AS name,
+                   node.canonical_name AS canonical_name,
+                   node.entity_type AS entity_type,
+                   node.description AS description, score
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            query=q,
+            limit=limit,
+        )
+        return {"results": [dict(r) async for r in result]}
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────
