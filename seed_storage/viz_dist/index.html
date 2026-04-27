@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AntHaul Graph Explorer</title>
+  <script type="module" crossorigin src="/viz/assets/index-BZpS-W4a.js"></script>
+  <link rel="stylesheet" crossorigin href="/viz/assets/index-Bu6QNJ7i.css">
+</head>
+<body>
+  <div id="app">
+    <div id="graph-container"></div>
+
+    <div id="controls">
+      <div id="search-box">
+        <input type="text" id="search-input" placeholder="Search entities..." autocomplete="off" />
+        <div id="search-results"></div>
+      </div>
+      <div id="filters">
+        <div id="node-type-filters"></div>
+        <div id="edge-type-filters"></div>
+      </div>
+      <div id="stats-bar"></div>
+    </div>
+
+    <div id="detail-panel" class="hidden">
+      <button id="detail-close">&times;</button>
+      <h2 id="detail-name"></h2>
+      <span id="detail-type" class="badge"></span>
+      <p id="detail-description"></p>
+      <div id="detail-aliases"></div>
+      <div id="detail-relationships"></div>
+    </div>
+
+    <div id="loading">
+      <div class="spinner"></div>
+      <p>Loading graph...</p>
+    </div>
+  </div>
+
+</body>
+</html>

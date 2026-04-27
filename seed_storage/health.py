@@ -28,14 +28,18 @@ Response body shape:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import redis as redis_lib
 from aiohttp import web
 
 from seed_storage.config import settings
+
+VIZ_DIST = Path(__file__).parent / "viz_dist"
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +277,113 @@ async def health_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=200)
 
 
+# ── Graph visualization endpoints ─────────────────────────────────────────
+
+
+async def _neo4j_query(cypher: str, **params) -> list[dict]:
+    """Run a Cypher query and return records as dicts."""
+    from seed_storage.graph import get_driver
+
+    driver = await get_driver()
+    async with driver.session() as session:
+        result = await session.run(cypher, **params)
+        return [dict(r) async for r in result]
+
+
+async def graph_full_handler(request: web.Request) -> web.Response:
+    """Return all entities and relationships for viz."""
+    limit = min(int(request.query.get("limit", "50000")), 100000)
+    try:
+        nodes = await _neo4j_query(
+            """
+            MATCH (e:__Entity__)
+            RETURN e.id AS id, e.name AS name, e.canonical_name AS canonical_name,
+                   e.entity_type AS entity_type, e.description AS description,
+                   e.aliases AS aliases, e.created_at AS created_at
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        edges = await _neo4j_query(
+            """
+            MATCH (a:__Entity__)-[r]->(b:__Entity__)
+            RETURN a.id AS source, b.id AS target, type(r) AS type,
+                   r.description AS description, r.confidence AS confidence
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        return web.json_response({"nodes": nodes, "edges": edges})
+    except Exception as exc:
+        logger.error("graph_full failed: %s", exc)
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def graph_search_handler(request: web.Request) -> web.Response:
+    """Search entities by name (fulltext)."""
+    q = request.query.get("q", "").strip()
+    if not q:
+        return web.json_response({"error": "missing q parameter"}, status=400)
+    limit = min(int(request.query.get("limit", "20")), 100)
+    try:
+        results = await _neo4j_query(
+            """
+            CALL db.index.fulltext.queryNodes('entity_name_fulltext', $query)
+            YIELD node, score
+            RETURN node.id AS id, node.name AS name,
+                   node.canonical_name AS canonical_name,
+                   node.entity_type AS entity_type,
+                   node.description AS description, score
+            ORDER BY score DESC
+            LIMIT $limit
+            """,
+            query=q,
+            limit=limit,
+        )
+        return web.json_response({"results": results})
+    except Exception as exc:
+        logger.error("graph_search failed: %s", exc)
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def graph_neighborhood_handler(request: web.Request) -> web.Response:
+    """Return the N-hop neighborhood of an entity."""
+    entity_id = request.match_info["entity_id"]
+    depth = min(int(request.query.get("depth", "1")), 3)
+    try:
+        records = await _neo4j_query(
+            """
+            MATCH (start:__Entity__ {id: $id})
+            CALL apoc.path.subgraphAll(start, {maxLevel: $depth,
+                 labelFilter: '__Entity__'})
+            YIELD nodes, relationships
+            UNWIND nodes AS n
+            WITH collect(DISTINCT {
+                id: n.id, name: n.name, canonical_name: n.canonical_name,
+                entity_type: n.entity_type, description: n.description,
+                aliases: n.aliases, created_at: n.created_at
+            }) AS nodeList, relationships
+            UNWIND relationships AS r
+            WITH nodeList, collect(DISTINCT {
+                source: startNode(r).id, target: endNode(r).id,
+                type: type(r), description: r.description,
+                confidence: r.confidence
+            }) AS edgeList
+            RETURN nodeList AS nodes, edgeList AS edges
+            """,
+            id=entity_id,
+            depth=depth,
+        )
+        if not records:
+            return web.json_response({"error": "Entity not found"}, status=404)
+        return web.json_response(
+            {"nodes": records[0]["nodes"], "edges": records[0]["edges"]}
+        )
+    except Exception as exc:
+        logger.error("graph_neighborhood failed: %s", exc)
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 # ── aiohttp app ────────────────────────────────────────────────────────────
 
 
@@ -280,6 +391,13 @@ def make_app() -> web.Application:
     """Factory — creates a fresh aiohttp Application (useful for testing)."""
     application = web.Application()
     application.router.add_get("/health", health_handler)
+    application.router.add_get("/api/graph/full", graph_full_handler)
+    application.router.add_get("/api/graph/search", graph_search_handler)
+    application.router.add_get(
+        "/api/graph/neighborhood/{entity_id}", graph_neighborhood_handler
+    )
+    if VIZ_DIST.is_dir():
+        application.router.add_static("/viz", VIZ_DIST, show_index=True)
     return application
 
 
