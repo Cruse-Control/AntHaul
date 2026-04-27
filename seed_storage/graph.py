@@ -152,7 +152,7 @@ async def upsert_entity(
             ON MATCH SET
                 e.description = CASE WHEN size(e.description) < size($description)
                                      THEN $description ELSE e.description END,
-                e.aliases = [x IN (coalesce(e.aliases, []) + $aliases) WHERE x IS NOT NULL | x],
+                e.aliases = apoc.coll.toSet([x IN (coalesce(e.aliases, []) + $aliases) WHERE x IS NOT NULL | x]),
                 e.embedding = $embedding,
                 e.updated_at = $now
             RETURN e.id AS id
