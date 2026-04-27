@@ -33,9 +33,33 @@ SOURCE_ENTITY_TYPES: dict[str, list[str]] = {
 }
 
 RELATIONSHIP_TYPES = [
-    "WORKS_FOR", "FOUNDED", "DISCUSSES", "CITES", "CREATED", "USES",
-    "PART_OF", "LOCATED_IN", "RELATED_TO", "SUPPORTS",
+    "WORKS_FOR", "FOUNDED", "CREATED", "USES",
+    "PART_OF", "LOCATED_IN", "RELATED_TO", "SUPPORTS", "CITES",
 ]
+
+# Strict definitions to prevent hallucinated relationships.
+# The LLM must be told what each type means and what it does NOT mean.
+RELATIONSHIP_DEFINITIONS = """Relationship types and their STRICT definitions:
+- WORKS_FOR: Person is currently employed by an Organization. NOT: collaborates with, scheduled a meeting with, is mentioned alongside.
+- FOUNDED: Person created/co-founded an Organization or major Project from scratch. NOT: contributed to, works on, discussed.
+- CREATED: Person built/authored a specific artifact (a tool, paper, model, project). NOT: discussed it, uses it, made improvements to someone else's creation.
+- USES: Entity actively uses/deploys another entity as a tool or dependency. Must be a real ongoing usage, not a one-time mention.
+- PART_OF: Entity is a component/member of a larger entity. e.g., a library that is part of a framework, a person who is a member of an organization.
+- LOCATED_IN: Entity is physically located in a Place. Must be a current or primary location, not a mention of travel.
+- SUPPORTS: Entity provides resources, funding, or infrastructure to another entity. NOT: merely discusses or endorses.
+- CITES: Entity explicitly references another entity's work in a substantive way (not just a passing mention).
+- RELATED_TO: Use ONLY as last resort when a clear, factual relationship exists but doesn't fit other types. NOT: appeared in the same conversation, mentioned in the same paragraph.
+
+CRITICAL RULES for relationships:
+- Only extract relationships that represent FACTUAL, VERIFIABLE claims — not conversational context.
+- "Person A discusses topic B in a Discord chat" is NOT a relationship. Do not extract it.
+- "Person A mentions tool B" is NOT a relationship unless they actually use/create/support it.
+- If two people appear in the same conversation, that does NOT make them RELATED_TO each other.
+- Set confidence to 0.9+ only for relationships explicitly stated as fact in the text.
+- Set confidence to 0.7-0.89 for relationships that are strongly implied but not explicitly stated.
+- Set confidence below 0.7 for uncertain or weakly implied relationships.
+- When in doubt, DO NOT extract the relationship. Fewer accurate relationships are better than many noisy ones.
+"""
 
 # Extraction JSON schema for OpenAI structured output
 EXTRACTION_SCHEMA = {
@@ -67,8 +91,9 @@ EXTRACTION_SCHEMA = {
                         "target": {"type": "string"},
                         "relationship_type": {"type": "string"},
                         "description": {"type": "string"},
+                        "confidence": {"type": "number"},
                     },
-                    "required": ["source", "target", "relationship_type", "description"],
+                    "required": ["source", "target", "relationship_type", "description", "confidence"],
                     "additionalProperties": False,
                 },
             },
@@ -77,6 +102,9 @@ EXTRACTION_SCHEMA = {
         "additionalProperties": False,
     },
 }
+
+# Minimum confidence to write a relationship to the graph
+MIN_RELATIONSHIP_CONFIDENCE = 0.75
 
 
 def _build_system_prompt(source_type: str, alias_map: dict[str, str]) -> str:
@@ -94,13 +122,14 @@ def _build_system_prompt(source_type: str, alias_map: dict[str, str]) -> str:
 
     alias_block = "\n".join(known_aliases[:20]) if known_aliases else "  (none)"
 
-    return f"""You extract structured entities and relationships from content.
+    return f"""You extract structured entities and relationships from content for a knowledge graph.
 
 Extract entities of these types: {', '.join(entity_types)}.
 For each entity: name (as mentioned in text), type (from the list above), description (1 sentence), aliases if known.
-For each relationship: source entity name, target entity name, type (from: {', '.join(RELATIONSHIP_TYPES)}), description (1 sentence).
 
-Rules:
+{RELATIONSHIP_DEFINITIONS}
+
+Entity rules:
 - Only extract entities clearly mentioned in the text. Do not infer entities not present.
 - Do not extract URLs, hashtags, or generic phrases ("the project", "this tool") as entities.
 - Use the canonical name for known entities listed below.
@@ -153,11 +182,19 @@ def _parse_extraction(raw: dict, model_used: str, input_tokens: int,
         ))
     relationships = []
     for r in raw.get("relationships", []):
+        conf = r.get("confidence", 0.5)
+        if conf < MIN_RELATIONSHIP_CONFIDENCE:
+            continue
+        rel_type = r.get("relationship_type", "RELATED_TO")
+        # Drop DISCUSSES — it's just "mentioned in same content", not a real relationship
+        if rel_type == "DISCUSSES":
+            continue
         relationships.append(ExtractedRelationship(
             source=r["source"].lower().strip(),
             target=r["target"].lower().strip(),
-            relationship_type=r.get("relationship_type", "RELATED_TO"),
+            relationship_type=rel_type,
             description=r.get("description", ""),
+            confidence=conf,
         ))
     return ExtractionResult(
         entities=entities,

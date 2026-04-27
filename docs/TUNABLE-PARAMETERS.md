@@ -37,8 +37,16 @@ All parameters are configured via `seed_storage/config.py` (pydantic-settings `S
 
 | Parameter | Default | Location | Effect |
 |-----------|---------|----------|--------|
-| Leiden gamma | 1.0 | `communities.run_leiden(gamma=)` | Resolution parameter. Higher = more communities. 1.0 is standard. |
-| Summary limit | 20 | `communities.summarize_communities(limit=)` | Max communities to summarize per run. |
+| Leiden gamma | 10.0 | `communities.run_leiden(gamma=)` | Resolution parameter. Higher = more, smaller communities. Calibrated 2026-04-27 for sparse graph (~1 edge/entity). |
+| Min community size | 3 | `communities.MIN_COMMUNITY_SIZE` | Communities smaller than this are not materialized as __Community__ nodes. |
+| Relationship types | all 10 | `communities.COMMUNITY_REL_TYPES` | Entity-entity rel types included in Leiden projection. |
+| Summary limit | 200 | `communities.summarize_communities(limit=)` | Max communities to summarize per run. |
+
+**Tuning guidance:**
+- Use `scripts/calibrate_communities.py` to sweep gamma values non-destructively.
+- At 2411 entities / 2433 edges, gamma=10.0 yields ~172 communities after filtering.
+- If graph grows denser (more edges per entity), gamma can be lowered toward 5.0.
+- If communities are still too broad, try excluding RELATED_TO via the calibration script.
 
 ## Cost Controls
 
