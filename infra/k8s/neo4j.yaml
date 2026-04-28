@@ -47,11 +47,11 @@ spec:
             - name: NEO4J_PLUGINS
               value: '["apoc", "graph-data-science"]'
             - name: NEO4J_server_memory_heap_initial__size
-              value: "256m"
-            - name: NEO4J_server_memory_heap_max__size
               value: "512m"
+            - name: NEO4J_server_memory_heap_max__size
+              value: "1g"
             - name: NEO4J_server_memory_pagecache_size
-              value: "256m"
+              value: "512m"
             - name: NEO4J_server_config_strict__validation_enabled
               value: "false"
             - name: NEO4J_dbms_security_procedures_unrestricted
@@ -64,10 +64,10 @@ spec:
           resources:
             requests:
               cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: "1"
               memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
           livenessProbe:
             httpGet:
               path: /
