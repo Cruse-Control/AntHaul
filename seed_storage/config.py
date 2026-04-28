@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     # --- LLM provider ---
     LLM_PROVIDER: str = "openai"  # openai | anthropic | groq
     OPENAI_API_KEY: str = ""  # required for embeddings regardless of LLM_PROVIDER
+    OPENAI_API_KEY_PATH: str = ""
     ANTHROPIC_API_KEY: str = ""
     GROQ_API_KEY: str = ""
     LLM_MODEL: str = "gpt-4o-mini"
@@ -162,6 +163,7 @@ class Settings(BaseSettings):
             ("DISCORD_BOT_TOKEN_PATH", "DISCORD_BOT_TOKEN"),
             ("DISCORD_ALERTS_WEBHOOK_PATH", "DISCORD_ALERTS_WEBHOOK_URL"),
             ("GITHUB_TOKEN_PATH", "GITHUB_TOKEN"),
+            ("OPENAI_API_KEY_PATH", "OPENAI_API_KEY"),
         ]
         for path_field, value_field in pairs:
             path = getattr(self, path_field)
