@@ -39,6 +39,9 @@ dev = [
     "ruff>=0.7",
 ]
 
+[tool.setuptools.packages.find]
+include = ["seed_storage*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
