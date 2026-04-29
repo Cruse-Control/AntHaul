@@ -4,17 +4,21 @@ Applies signal filter to drop noise. Captures discord_msg_id in metadata.
 Routes content from #ant-food-router to the correct typed channel.
 """
 
+import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 import httpx
 
+from ingestion.catchup import run_catchup
 from ingestion.classifier import Platform, classify, extract_urls
 from ingestion.pipeline_worker import PipelineWorker
 from ingestion.signal_filter import is_noise
 from seed_storage import staging
+from seed_storage.staging import get_bot_last_seen, upsert_bot_last_seen
 
 log = logging.getLogger("watcher")
 
@@ -86,7 +90,13 @@ async def start_watcher():
 
     @client.event
     async def on_ready():
-        log.info("Connected as %s — watching %d channels", client.user, len(watched_ids))
+        last_seen = get_bot_last_seen()
+        log.info("Connected as %s — watching %d channels. Last seen: %s",
+                 client.user, len(watched_ids), last_seen or "never")
+        # Update last_seen immediately so we know when this session started
+        upsert_bot_last_seen(datetime.now(timezone.utc).isoformat())
+        # Run catch-up in background to not delay on_ready
+        asyncio.create_task(run_catchup(token, watched_ids, after_timestamp=last_seen))
 
     @client.event
     async def on_message(message: discord.Message):
@@ -104,12 +114,14 @@ async def start_watcher():
             # In non-router channels: always process own messages (routed content).
 
         text = message.content.strip()
-        if not text:
-            return
 
-        # ── Router channel: repost to correct typed channel ──────────
+        # ── Router channel: handle even if no text (may have attachments) ──
         if message.channel.id in ROUTER_CHANNEL_IDS:
             await _handle_router(message, text, token)
+            return
+
+        # ── Normal channel: skip if no content and no attachments ──────────
+        if not text and not message.attachments:
             return
 
         # ── Normal channel: capture and stage ────────────────────────
@@ -189,6 +201,12 @@ async def start_watcher():
 async def _handle_router(message: discord.Message, text: str, token: str):
     """Route content from #ant-food-router to the correct typed channel."""
     urls = extract_urls(text)
+    # Include Discord CDN attachment URLs so attachment-only messages get routed
+    attachment_urls = [a.url for a in message.attachments if a.url]
+    # Deduplicate: keep attachment URLs not already found in text
+    for au in attachment_urls:
+        if au not in urls:
+            urls.append(au)
 
     if not urls:
         # Plain text with no URL — stage it here (no better place).
