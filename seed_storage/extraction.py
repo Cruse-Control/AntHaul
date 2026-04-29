@@ -227,8 +227,8 @@ def extract_one(item: dict, client: OpenAI | None = None,
     if isinstance(meta, str):
         meta = json.loads(meta)
 
-    # Skip tiny content
-    if len(content.split()) < 50 and not meta.get("media_urls"):
+    # Skip tiny content (15 words — low enough for tweets, which cap at ~70 words)
+    if len(content.split()) < 15 and not meta.get("media_urls"):
         return ExtractionResult(
             entities=[], relationships=[],
             model_used="skipped", tokens_input=0, tokens_output=0,
