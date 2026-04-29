@@ -51,7 +51,7 @@ BOT_CONNECTED_KEY = "seed:bot:connected"
 CELERY_RAW_QUEUE = "raw_messages"
 CELERY_GRAPH_QUEUE = "graph_ingest"
 
-CHECK_TIMEOUT = 2.0  # seconds — per-check timeout (must fit within k8s liveness probe)
+CHECK_TIMEOUT = 5.0  # seconds — per-check timeout (must fit within k8s liveness probe)
 
 
 # ── Individual check functions (module-level for testability) ──────────────
