@@ -32,6 +32,8 @@ dependencies = [
     "unstructured>=0.14",
     "openai-whisper>=20231117",
     "youtube-transcript-api>=0.6",
+    # Audible book ingestion (optional — only needed for DRM path)
+    "audible>=0.10",
 ]
 
 [project.optional-dependencies]
