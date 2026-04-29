@@ -325,6 +325,53 @@ def reset_orphaned_extracting(timeout_hours: int = 1) -> int:
     return count
 
 
+def get_by_discord_msg_id(msg_id: str) -> dict | None:
+    """Return the staging row for a Discord message ID, or None if not staged."""
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id FROM seed_staging WHERE metadata->>'discord_msg_id' = %s LIMIT 1",
+                (msg_id,)
+            )
+            return cur.fetchone()
+
+
+def upsert_bot_last_seen(timestamp: str) -> None:
+    """Record the bot's last successful Discord connection time.
+
+    Creates the seed_bot_state table if it doesn't exist.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS seed_bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                INSERT INTO seed_bot_state (key, value, updated_at)
+                VALUES ('bot_last_seen', %s, now())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+            """, (timestamp,))
+        conn.commit()
+
+
+def get_bot_last_seen() -> str | None:
+    """Return the ISO timestamp of the bot's last connection, or None if never recorded."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT value FROM seed_bot_state WHERE key = 'bot_last_seen'"
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+            except Exception:
+                return None
+
+
 def reset_to_status(
     target_status: str,
     *,
