@@ -857,3 +857,67 @@ def post_daily_digest(self) -> int:
         except self.MaxRetriesExceededError:
             logger.error("post_daily_digest: max retries exceeded")
             return 0
+
+
+# ---------------------------------------------------------------------------
+# Task: generate_graph_index
+# ---------------------------------------------------------------------------
+
+
+@app.task(
+    bind=True,
+    name="seed_storage.worker.tasks.generate_graph_index",
+    queue="graph_ingest",
+    max_retries=2,
+    default_retry_delay=60,
+)
+def generate_graph_index(self) -> int:
+    """Generate the graph index document and store in Neo4j __Meta__ node.
+
+    Runs daily at 12:30 UTC (15 min after daily digest).
+    Also posts a summary to #seed-storage Discord channel.
+    """
+    try:
+        import asyncio
+        from scripts.generate_index import generate
+        asyncio.run(generate())
+        logger.info("generate_graph_index: completed")
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        logger.error("generate_graph_index: failed: %s", exc, exc_info=True)
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            return 0
+
+
+# ---------------------------------------------------------------------------
+# Task: run_graph_lint
+# ---------------------------------------------------------------------------
+
+
+@app.task(
+    bind=True,
+    name="seed_storage.worker.tasks.run_graph_lint",
+    queue="graph_ingest",
+    max_retries=2,
+    default_retry_delay=60,
+)
+def run_graph_lint(self) -> int:
+    """Run graph health check and store report in Neo4j __Meta__ node.
+
+    Runs weekly Monday at 13:00 UTC.
+    Also posts a summary to #seed-storage Discord channel.
+    """
+    try:
+        import asyncio
+        from scripts.lint_graph import lint
+        asyncio.run(lint())
+        logger.info("run_graph_lint: completed")
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        logger.error("run_graph_lint: failed: %s", exc, exc_info=True)
+        try:
+            raise self.retry(exc=exc)
+        except self.MaxRetriesExceededError:
+            return 0

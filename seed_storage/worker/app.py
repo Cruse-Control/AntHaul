@@ -42,6 +42,8 @@ app.config_from_object(
             "seed_storage.worker.tasks.expand_from_frontier": {"queue": "graph_ingest"},
             "seed_storage.worker.tasks.scan_frontier": {"queue": "graph_ingest"},
             "seed_storage.worker.tasks.post_daily_digest": {"queue": "graph_ingest"},
+            "seed_storage.worker.tasks.generate_graph_index": {"queue": "graph_ingest"},
+            "seed_storage.worker.tasks.run_graph_lint": {"queue": "graph_ingest"},
         },
         # Queue definitions
         "task_queues": (
@@ -62,6 +64,16 @@ app.config_from_object(
             "daily-digest-1215-utc": {
                 "task": "seed_storage.worker.tasks.post_daily_digest",
                 "schedule": crontab(hour=12, minute=15),
+                "options": {"queue": "graph_ingest"},
+            },
+            "generate-graph-index-daily": {
+                "task": "seed_storage.worker.tasks.generate_graph_index",
+                "schedule": crontab(hour=12, minute=30),
+                "options": {"queue": "graph_ingest"},
+            },
+            "run-graph-lint-weekly": {
+                "task": "seed_storage.worker.tasks.run_graph_lint",
+                "schedule": crontab(day_of_week=1, hour=13, minute=0),
                 "options": {"queue": "graph_ingest"},
             },
         },
