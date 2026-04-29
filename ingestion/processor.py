@@ -685,6 +685,18 @@ def _extract_yt_id(url: str) -> str:
 def _get_yt_transcript(video_id: str) -> str:
     from youtube_transcript_api import YouTubeTranscriptApi
 
+    # v1.x API: instance method .fetch()
+    if hasattr(YouTubeTranscriptApi, "fetch") and not isinstance(
+        YouTubeTranscriptApi.__dict__.get("fetch"), classmethod
+    ):
+        try:
+            api = YouTubeTranscriptApi()
+            result = api.fetch(video_id)
+            return " ".join(snippet.text for snippet in result)
+        except Exception:
+            return f"[No transcript available for video {video_id}]"
+
+    # v0.x API: class method .get_transcript()
     try:
         entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
         return " ".join(e["text"] for e in entries)
