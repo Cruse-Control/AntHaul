@@ -2,9 +2,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-ContentType = Literal["webpage", "youtube", "video", "image", "pdf", "github", "tweet", "unknown"]
+ContentType = Literal[
+    "webpage", "youtube", "video", "image", "pdf", "github", "tweet", "instagram", "unknown"
+]
 
-_CONTENT_TYPES = {"webpage", "youtube", "video", "image", "pdf", "github", "tweet", "unknown"}
+_CONTENT_TYPES = {
+    "webpage",
+    "youtube",
+    "video",
+    "image",
+    "pdf",
+    "github",
+    "tweet",
+    "instagram",
+    "unknown",
+}
 
 
 @dataclass

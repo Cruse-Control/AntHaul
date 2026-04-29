@@ -21,8 +21,8 @@ DEPTH_POLICIES: dict[str, int] = {
     "image": 2,
     "video": 2,
     "webpage": 4,
-    "tweet": 0,  # Twitter is a stub resolver; do not expand
-    "twitter": 0,  # alias for tweet
+    "tweet": 1,
+    "twitter": 1,
     "unknown": 2,
     "fallback": 1,
     "default": 3,
@@ -46,8 +46,8 @@ RESOLVER_BONUS: dict[str, float] = {
     "image": 0.0,
     "video": 0.1,
     "webpage": 0.0,
-    "tweet": -1.0,
-    "twitter": -1.0,
+    "tweet": 0.1,
+    "twitter": 0.1,
     "unknown": 0.0,
     "fallback": -0.1,
 }

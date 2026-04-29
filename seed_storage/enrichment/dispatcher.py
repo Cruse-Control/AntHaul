@@ -26,6 +26,7 @@ from seed_storage.enrichment.resolvers.base import BaseResolver
 from seed_storage.enrichment.resolvers.fallback import FallbackResolver
 from seed_storage.enrichment.resolvers.github import GitHubResolver
 from seed_storage.enrichment.resolvers.image import ImageResolver
+from seed_storage.enrichment.resolvers.instagram import InstagramResolver
 from seed_storage.enrichment.resolvers.pdf import PDFResolver
 from seed_storage.enrichment.resolvers.twitter import TwitterResolver
 from seed_storage.enrichment.resolvers.video import VideoResolver
@@ -39,6 +40,7 @@ _DEFAULT_RESOLVERS: list[BaseResolver] = [
     TwitterResolver(),
     YouTubeResolver(),
     GitHubResolver(),
+    InstagramResolver(),
     ImageResolver(),
     PDFResolver(),
     VideoResolver(),

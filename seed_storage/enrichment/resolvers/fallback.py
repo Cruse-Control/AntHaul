@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, datetime
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -90,6 +90,7 @@ class FallbackResolver(BaseResolver):
 
         title: str | None = None
         text = ""
+        expansion_urls: list[str] = []
 
         try:
             from bs4 import BeautifulSoup  # type: ignore[import-untyped]
@@ -100,6 +101,23 @@ class FallbackResolver(BaseResolver):
             title_tag = soup.find("title")
             if title_tag:
                 title = title_tag.get_text(strip=True)
+
+            # Extract expansion links from <a href>
+            final_url = str(response.url)
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                if href.startswith(("http://", "https://")):
+                    expansion_urls.append(href)
+                elif href.startswith("/"):
+                    parsed = urlparse(final_url)
+                    expansion_urls.append(f"{parsed.scheme}://{parsed.netloc}{href}")
+                elif not href.startswith(("#", "mailto:", "javascript:")):
+                    expansion_urls.append(urljoin(final_url, href))
+            # Deduplicate
+            seen: set[str] = set()
+            expansion_urls = [
+                u for u in expansion_urls if u.startswith("http") and not (u in seen or seen.add(u))
+            ]  # type: ignore[func-returns-value]
 
             # Remove script/style elements
             for tag in soup(["script", "style", "nav", "footer", "header"]):
@@ -122,7 +140,7 @@ class FallbackResolver(BaseResolver):
             text=text,
             transcript=None,
             summary=None,
-            expansion_urls=[],
+            expansion_urls=expansion_urls[:50],
             metadata={"fallback": True},
             extraction_error=None,
             resolved_at=datetime.now(tz=UTC),

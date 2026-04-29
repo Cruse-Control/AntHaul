@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 # ~4 chars per token × 8000 tokens
 _MAX_CHARS = 32_000
-_TIMEOUT = 15.0
+_TIMEOUT = 30.0
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def _extract_links(html: str, base_url: str) -> list[str]:
@@ -63,7 +67,7 @@ class WebpageResolver(BaseResolver):
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=_TIMEOUT,
-                headers={"User-Agent": "seed-storage/2.0 (+https://github.com/Cruse-Control)"},
+                headers={"User-Agent": _USER_AGENT},
             ) as client:
                 response = await client.get(url)
                 response.raise_for_status()
@@ -88,7 +92,8 @@ class WebpageResolver(BaseResolver):
                 html,
                 include_links=False,
                 include_images=False,
-                favor_recall=False,
+                include_tables=True,
+                favor_recall=True,
                 deduplicate=True,
             )
             if text:

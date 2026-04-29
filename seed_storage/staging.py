@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timezone
-
 import psycopg2
 import psycopg2.extras
 
@@ -69,6 +66,7 @@ def stage(
     created_at: str | None = None,
     media_urls: list[str] | None = None,
     metadata: dict | None = None,
+    status: str = "staged",
 ) -> str | None:
     """Stage a piece of content. Returns the id, or None if already staged (dedup by URI)."""
     word_count = len(raw_content.split())
@@ -80,8 +78,8 @@ def stage(
             cur.execute(
                 """
                 INSERT INTO seed_staging (source_type, source_uri, raw_content, media_urls,
-                    word_count, token_estimate, author, channel, created_at, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    word_count, token_estimate, author, channel, created_at, metadata, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (source_uri) DO NOTHING
                 RETURNING id
                 """,
@@ -96,6 +94,7 @@ def stage(
                     channel,
                     created_at,
                     meta,
+                    status,
                 ),
             )
             row = cur.fetchone()
@@ -157,7 +156,11 @@ def summary() -> dict:
             """)
             rows = [dict(r) for r in cur.fetchall()]
             total_tokens = sum(r["total_tokens"] or 0 for r in rows)
-            return {"by_type": rows, "total_tokens": total_tokens, "total_items": sum(r["items"] for r in rows)}
+            return {
+                "by_type": rows,
+                "total_tokens": total_tokens,
+                "total_items": sum(r["items"] for r in rows),
+            }
 
 
 def get_recently_loaded(hours: int = 24) -> list[dict]:
@@ -174,7 +177,9 @@ def get_recently_loaded(hours: int = 24) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
-def update_content(item_id: str, raw_content: str, metadata: dict | None = None, status: str = "processed"):
+def update_content(
+    item_id: str, raw_content: str, metadata: dict | None = None, status: str = "processed"
+):
     """Update a staged item with processed content (Step 2)."""
     word_count = len(raw_content.split())
     token_estimate = int(word_count * 1.33)
@@ -216,6 +221,7 @@ def patch_metadata(item_id: str, patch: dict):
     Idempotent: running twice with the same patch is safe.
     """
     import psycopg2.extras
+
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -226,6 +232,7 @@ def patch_metadata(item_id: str, patch: dict):
 
 
 # ── Circuit Breaker ──────────────────────────────────────────────────
+
 
 def init_circuit_breaker_table():
     """Create the circuit breaker table. Idempotent."""

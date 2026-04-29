@@ -1,8 +1,9 @@
 """YouTube resolver — yt-dlp metadata + transcript extraction.
 
 Extracts video metadata (title, description, channel, duration, view count)
-and the best available transcript (manual captions → auto-generated → yt-dlp
-transcription fallback). Truncates transcript at 12 000 tokens (~48 000 chars).
+and the best available transcript. Uses youtube_transcript_api for transcripts
+(more reliable than yt-dlp subtitle data with skip_download=True), with yt-dlp
+subtitle data as fallback. Truncates transcript at 12 000 tokens (~48 000 chars).
 """
 
 from __future__ import annotations
@@ -48,8 +49,32 @@ def _truncate(text: str) -> str:
     return text
 
 
+def _get_transcript_api(video_id: str) -> str | None:
+    """Get transcript via youtube_transcript_api (most reliable method)."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+
+        # Try English first
+        try:
+            entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            return " ".join(e["text"] for e in entries)
+        except Exception:
+            pass
+
+        # Fall back to any language
+        try:
+            entries = YouTubeTranscriptApi.get_transcript(video_id)
+            return " ".join(e["text"] for e in entries)
+        except Exception:
+            pass
+    except ImportError:
+        logger.debug("youtube_transcript_api not installed")
+
+    return None
+
+
 class YouTubeResolver(BaseResolver):
-    """Resolves YouTube video URLs using yt-dlp."""
+    """Resolves YouTube video URLs using yt-dlp + youtube_transcript_api."""
 
     def can_handle(self, url: str) -> bool:
         parsed = urlparse(url)
@@ -66,7 +91,6 @@ class YouTubeResolver(BaseResolver):
         import asyncio
 
         loop = asyncio.get_event_loop()
-        # yt-dlp is synchronous — run in executor to avoid blocking event loop
         result = await loop.run_in_executor(None, self._fetch_ydl, url)
         return result
 
@@ -95,29 +119,34 @@ class YouTubeResolver(BaseResolver):
         duration = info.get("duration")
         view_count = info.get("view_count")
         upload_date = info.get("upload_date")  # YYYYMMDD string
+        video_id = _extract_video_id(url) or info.get("id") or ""
 
         # --- Transcript extraction ---
         transcript: str | None = None
 
-        # Manual captions first
-        subtitles: dict = info.get("subtitles") or {}
-        auto_captions: dict = info.get("automatic_captions") or {}
+        # Method 1: youtube_transcript_api (most reliable)
+        if video_id:
+            transcript = _get_transcript_api(video_id)
 
-        for sub_dict in (subtitles, auto_captions):
-            for lang_key in ("en", "en-US", "en-GB"):
-                if lang_key in sub_dict:
-                    entries = sub_dict[lang_key]
-                    # Find a text/vtt/srv3 format
-                    for entry in entries:
-                        if entry.get("ext") in ("vtt", "srv3", "srv2", "srv1", "json3"):
-                            raw = entry.get("data")
-                            if raw:
-                                transcript = _clean_vtt(raw)
+        # Method 2: yt-dlp subtitle data (fallback — often empty with skip_download)
+        if not transcript:
+            subtitles: dict = info.get("subtitles") or {}
+            auto_captions: dict = info.get("automatic_captions") or {}
+
+            for sub_dict in (subtitles, auto_captions):
+                for lang_key in ("en", "en-US", "en-GB"):
+                    if lang_key in sub_dict:
+                        entries = sub_dict[lang_key]
+                        for entry in entries:
+                            if entry.get("ext") in ("vtt", "srv3", "srv2", "srv1", "json3"):
+                                raw = entry.get("data")
+                                if raw:
+                                    transcript = _clean_vtt(raw)
+                                break
+                        if transcript:
                             break
-                    if transcript:
-                        break
-            if transcript:
-                break
+                if transcript:
+                    break
 
         # Build text from description + transcript
         text_parts = []
@@ -131,13 +160,20 @@ class YouTubeResolver(BaseResolver):
         if transcript:
             transcript = _truncate(transcript)
 
+        # Extract URLs from description for expansion
+        expansion_urls = []
+        for match in re.finditer(r"https?://[^\s<>\"']+", description):
+            expansion_urls.append(match.group(0))
+
         metadata: dict = {
             "channel": channel,
             "duration_seconds": duration,
             "view_count": view_count,
             "upload_date": upload_date,
-            "video_id": _extract_video_id(url),
+            "video_id": video_id,
         }
+        if channel:
+            metadata["speakers"] = [{"name": channel, "role": "creator", "platform": "youtube"}]
 
         return ResolvedContent(
             source_url=url,
@@ -146,7 +182,7 @@ class YouTubeResolver(BaseResolver):
             text=text,
             transcript=transcript,
             summary=None,
-            expansion_urls=[],
+            expansion_urls=expansion_urls[:20],
             metadata=metadata,
             extraction_error=None,
             resolved_at=datetime.now(tz=UTC),

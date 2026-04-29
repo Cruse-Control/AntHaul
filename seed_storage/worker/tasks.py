@@ -155,6 +155,29 @@ def _get_domain(url: str) -> str:
         return ""
 
 
+def _classify_resolver_hint(url: str) -> str:
+    """Classify a URL into a resolver_hint based on domain."""
+    domain = _get_domain(url)
+    if domain in ("youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"):
+        return "youtube"
+    if domain in ("github.com", "www.github.com"):
+        return "github"
+    if domain in ("twitter.com", "www.twitter.com", "x.com", "www.x.com"):
+        return "tweet"
+    if domain in ("instagram.com", "www.instagram.com"):
+        return "instagram"
+    if domain in ("arxiv.org", "www.arxiv.org"):
+        return "webpage"
+    path = urlparse(url).path.lower()
+    if path.endswith(".pdf"):
+        return "pdf"
+    if any(path.endswith(ext) for ext in (".mp4", ".mov", ".webm", ".avi")):
+        return "video"
+    if any(path.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
+        return "image"
+    return "webpage"
+
+
 # ---------------------------------------------------------------------------
 # Task: enrich_message
 # ---------------------------------------------------------------------------
@@ -247,7 +270,9 @@ def enrich_message(self, raw_payload: dict) -> None:
 
         # Persist resolved content to Postgres staging before Celery handoff.
         # This ensures the data is durable and replayable even if ingest_episode fails.
-        _persist_to_staging(raw_payload, resolved_contents)
+        # URL content items are staged at "processed" (content already resolved).
+        url_uris = _persist_to_staging(raw_payload, resolved_contents)
+        enriched_payload["url_content_uris"] = url_uris
 
         # Enqueue for graph ingest
         ingest_episode.delay(enriched_payload)
@@ -292,12 +317,13 @@ async def _resolve_urls(dispatcher: ContentDispatcher, urls: list[str]) -> list[
     return list(await _asyncio.gather(*tasks))
 
 
-def _persist_to_staging(raw_payload: dict, resolved_contents: list[ResolvedContent]) -> None:
+def _persist_to_staging(raw_payload: dict, resolved_contents: list[ResolvedContent]) -> list[str]:
     """Persist message + resolved content to Postgres staging.
 
-    Stages the original message (if not already staged) and each resolved
-    content item as separate staging rows. This makes the data durable --
-    even if ingest_episode fails, the content can be replayed from Postgres.
+    Stages the original message at 'staged' and each resolved content item
+    at 'processed' (content already extracted by the dispatcher). Returns
+    the list of source_uris for staged URL content items so ingest_episode
+    can process them.
     """
     from seed_storage import staging
 
@@ -320,24 +346,30 @@ def _persist_to_staging(raw_payload: dict, resolved_contents: list[ResolvedConte
         metadata={"discord_context": content[:200]},
     )
 
-    # Stage each resolved content item
+    # Stage each resolved content item at "processed" — content is already
+    # extracted by the dispatcher, so skip the processor stage.
+    url_uris: list[str] = []
     for rc in resolved_contents:
         if not rc.text and not rc.transcript and not rc.summary:
             continue
         text = rc.text or rc.transcript or rc.summary or ""
-        staging.stage(
+        sid = staging.stage(
             source_type=rc.content_type,
             source_uri=rc.source_url,
             raw_content=text,
             author=author,
             channel=source_channel,
             created_at=timestamp,
+            status="processed",
             metadata={
                 "title": rc.title,
                 "expansion_urls": rc.expansion_urls[:10],
                 "discord_context": content[:200],
             },
         )
+        if sid:
+            url_uris.append(rc.source_url)
+    return url_uris
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +400,8 @@ def ingest_episode(self, enriched_payload: dict) -> None:
     """
     message = enriched_payload.get("message", {})
     resolved_contents_raw = enriched_payload.get("resolved_contents", [])
+    url_content_uris = enriched_payload.get("url_content_uris", [])
 
-    source_type = message.get("source_type", "unknown")
     source_id = message.get("source_id", "")
     source_channel = message.get("source_channel", "unknown")
     channel_id = message.get("metadata", {}).get("channel_id", "")
@@ -388,46 +420,65 @@ def ingest_episode(self, enriched_payload: dict) -> None:
             try:
                 raise self.retry(countdown=300)
             except self.MaxRetriesExceededError:
-                dead_letter("ingest_episode", enriched_payload, Exception("budget_exceeded"), self.request.retries)
+                dead_letter(
+                    "ingest_episode",
+                    enriched_payload,
+                    Exception("budget_exceeded"),
+                    self.request.retries,
+                )
                 return
 
         if circuit_breaker.is_open():
             logger.warning("ingest_episode: circuit breaker open, skipping")
             return
 
-        # Find the staging row persisted by _persist_to_staging
         from seed_storage import staging as _staging
+        from seed_storage.extraction import extract_one
+        from seed_storage.preseed import get_alias_map, init_preseed_table
+
+        init_preseed_table()
+        alias_map = get_alias_map()
+
+        # --- Process the Discord message staging row ---
         msg_uri = f"discord://{source_channel}/{source_id}"
         item = _staging.get_by_uri(msg_uri)
 
         if item and item["status"] in ("staged", "processed", "enriched"):
-            # Run extraction
-            from seed_storage.extraction import extract_one
-            from seed_storage.preseed import get_alias_map, init_preseed_table
-            init_preseed_table()
-            alias_map = get_alias_map()
             result = extract_one(item, alias_map=alias_map)
-            _staging.patch_metadata(str(item["id"]), {
-                "extraction": {
-                    **result.model_dump(),
-                    "extracted_at": datetime.now(tz=UTC).isoformat(),
+            _staging.patch_metadata(
+                str(item["id"]),
+                {
+                    "extraction": {
+                        **result.model_dump(),
+                        "extracted_at": datetime.now(tz=UTC).isoformat(),
+                    },
                 },
-            })
+            )
             _staging.update_status([str(item["id"])], "extracted")
-
-            # Run load
             asyncio.run(_load_item_to_graph(item, alias_map))
-
             cost_tracker.increment()
             circuit_breaker.record_success()
         elif item and item["status"] == "extracted":
-            # Already extracted, just load
-            from seed_storage.preseed import get_alias_map, init_preseed_table
-            init_preseed_table()
-            alias_map = get_alias_map()
             asyncio.run(_load_item_to_graph(item, alias_map))
             cost_tracker.increment()
             circuit_breaker.record_success()
+
+        # --- Process URL content staging rows (staged at "processed") ---
+        for uri in url_content_uris:
+            try:
+                url_item = _staging.get_by_uri(uri)
+                if not url_item or url_item["status"] in ("loaded", "extracted", "enriched"):
+                    continue
+                # Enrich (tags + summary)
+                asyncio.run(_enrich_and_extract_item(url_item, alias_map))
+                # Reload after enrichment+extraction
+                url_item = _staging.get_by_uri(uri)
+                if url_item and url_item["status"] == "extracted":
+                    asyncio.run(_load_item_to_graph(url_item, alias_map))
+                    cost_tracker.increment()
+                    logger.info("ingest_episode: loaded URL content %s", uri)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ingest_episode: failed to process URL content %s: %s", uri, exc)
 
         # Add expansion_urls to frontier
         all_rcs = [ResolvedContent.from_dict(rc_dict) for rc_dict in resolved_contents_raw]
@@ -440,16 +491,21 @@ def ingest_episode(self, enriched_payload: dict) -> None:
             for exp_url in expansion_urls:
                 h = url_hash(exp_url)
                 domain = _get_domain(exp_url)
+                hint = _classify_resolver_hint(exp_url)
                 priority = compute_priority(
-                    depth=child_depth, resolver_hint="unknown",
-                    domain=domain, source_channel=source_channel,
+                    depth=child_depth,
+                    resolver_hint=hint,
+                    domain=domain,
+                    source_channel=source_channel,
                 )
                 meta = {
-                    "url": exp_url, "url_hash": h,
+                    "url": exp_url,
+                    "url_hash": h,
                     "discovered_from_url": rc.source_url,
                     "discovered_from_source_id": source_id,
                     "source_channel": source_channel,
-                    "depth": child_depth, "resolver_hint": "unknown",
+                    "depth": child_depth,
+                    "resolver_hint": hint,
                     "discovered_at": datetime.now(tz=UTC).isoformat(),
                 }
                 try:
@@ -460,7 +516,11 @@ def ingest_episode(self, enriched_payload: dict) -> None:
         _publish_reaction(r, source_id, channel_id, "🏷️")
         _publish_reaction(r, source_id, channel_id, "🧠")
 
-        logger.info("ingest_episode: completed source_id=%s", source_id)
+        logger.info(
+            "ingest_episode: completed source_id=%s (%d url items)",
+            source_id,
+            len(url_content_uris),
+        )
 
     except Exception as exc:  # noqa: BLE001
         logger.error("ingest_episode: failed source_id=%s: %s", source_id, exc, exc_info=True)
@@ -470,10 +530,95 @@ def ingest_episode(self, enriched_payload: dict) -> None:
             dead_letter("ingest_episode", enriched_payload, exc, self.request.retries)
 
 
+async def _enrich_and_extract_item(item: dict, alias_map: dict) -> None:
+    """Run enricher + extractor on a single staging item (for URL content in real-time path).
+
+    Takes an item at status 'processed', enriches it (tags/summary), extracts entities,
+    and updates status to 'extracted'.
+    """
+    import json
+
+    from seed_storage import config
+    from seed_storage import staging as _staging
+    from seed_storage.extraction import extract_one
+
+    item_id = str(item["id"])
+
+    # Enrich: add tags + summary via LLM
+    if config.LLM_API_KEY:
+        try:
+            from ingestion.enricher import (
+                ENRICHER_SYSTEM,
+                _build_llm_client,
+                _get_existing_tags,
+                _llm_chat,
+                _upsert_tags,
+                init_tags_table,
+            )
+
+            init_tags_table()
+            client, provider = _build_llm_client()
+            existing_tags = _get_existing_tags()
+
+            content = (item.get("raw_content") or "")[:3000]
+            source_type = item.get("source_type", "unknown")
+
+            prompt = ENRICHER_SYSTEM.replace("{existing_tags}", ", ".join(existing_tags[:100]))
+            user_msg = f"Source type: {source_type}\nContent:\n{content}"
+
+            raw = await _llm_chat(client, provider, prompt, user_msg, config.LLM_MODEL)
+
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+                if raw.endswith("```"):
+                    raw = raw[:-3].strip()
+            data = json.loads(raw)
+            tags = data.get("tags", [])
+            summary = data.get("summary", "")
+
+            meta = item.get("metadata") or {}
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            meta["tags"] = tags
+            meta["summary"] = summary
+            _staging.update_content(item_id, item["raw_content"], metadata=meta, status="enriched")
+
+            if tags:
+                _upsert_tags(tags)
+        except Exception:
+            logger.debug(
+                "Enrichment failed for URL item %s, continuing to extraction",
+                item_id,
+                exc_info=True,
+            )
+            _staging.update_status([item_id], "enriched")
+    else:
+        _staging.update_status([item_id], "enriched")
+
+    # Re-read after enrichment
+    item = _staging.get_by_id(item_id)
+    if not item or item["status"] != "enriched":
+        return
+
+    # Extract entities
+    result = extract_one(item, alias_map=alias_map)
+    _staging.patch_metadata(
+        item_id,
+        {
+            "extraction": {
+                **result.model_dump(),
+                "extracted_at": datetime.now(tz=UTC).isoformat(),
+            },
+        },
+    )
+    _staging.update_status([item_id], "extracted")
+
+
 async def _load_item_to_graph(item: dict, alias_map: dict) -> None:
     """Load a single staging item into Neo4j (async helper for ingest_episode)."""
-    from seed_storage.graph import get_driver
     from ingestion.loader import _load_one_item
+    from seed_storage.graph import get_driver
+
     driver = await get_driver()
     await _load_one_item(item, alias_map, None, driver, batch_id=None)
 
@@ -581,9 +726,10 @@ def expand_from_frontier(self, url_hash_str: str) -> None:
         for exp_url in expansion_urls:
             h = url_hash(exp_url)
             domain = _get_domain(exp_url)
+            hint = _classify_resolver_hint(exp_url)
             priority = compute_priority(
                 depth=child_depth,
-                resolver_hint="unknown",
+                resolver_hint=hint,
                 domain=domain,
                 source_channel=source_channel,
             )
@@ -594,7 +740,7 @@ def expand_from_frontier(self, url_hash_str: str) -> None:
                 "discovered_from_source_id": meta.get("discovered_from_source_id", ""),
                 "source_channel": source_channel,
                 "depth": child_depth,
-                "resolver_hint": "unknown",
+                "resolver_hint": hint,
                 "discovered_at": discovered_at,
             }
             try:

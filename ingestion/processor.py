@@ -101,7 +101,10 @@ async def process_one(
             # Non-blocking: try to add as submodule to inspirational-materials.
             try:
                 from ingestion.submodule_adder import add_submodule
-                sub_result = add_submodule(source_uri, description=content[:500], push=True, create_pr=True)
+
+                sub_result = add_submodule(
+                    source_uri, description=content[:500], push=True, create_pr=True
+                )
                 meta["submodule_status"] = sub_result.get("status", "unknown")
                 if sub_result.get("path"):
                     meta["submodule_path"] = sub_result["path"]
@@ -142,17 +145,26 @@ async def process_one(
         # Context-only fallback: store the Discord message as content.
         raw = item.get("raw_content", "")
         if raw and len(raw.strip()) > 10:
-            log.warning("HTTP extraction failed for [%s] %s — falling back to Discord context", source_type, source_uri)
+            log.warning(
+                "HTTP extraction failed for [%s] %s — falling back to Discord context",
+                source_type,
+                source_uri,
+            )
             staging.update_content(
-                item_id, raw,
+                item_id,
+                raw,
                 metadata={"fetch_status": "context_only"},
                 status="processed",
             )
             await discord_touch.react(item, "processed")
         else:
-            log.exception("Failed to process [%s] %s (no context to fall back to)", source_type, source_uri)
+            log.exception(
+                "Failed to process [%s] %s (no context to fall back to)", source_type, source_uri
+            )
             staging.update_status([item_id], "failed")
-            await discord_touch.react(item, "failed", error_msg=f"Extraction failed for {source_uri}")
+            await discord_touch.react(
+                item, "failed", error_msg=f"Extraction failed for {source_uri}"
+            )
 
 
 # ── Medium-specific extractors ─────────────────────────────────────
@@ -161,31 +173,106 @@ async def process_one(
 async def _process_instagram(
     http: httpx.AsyncClient, anthropic: AsyncAnthropic | None, base: str, url: str
 ) -> tuple[str, dict]:
-    """Transcript via MCP backend + adjudicator."""
-    resp = await http.post(f"{base}/api/video/analyze", json={"instagram_url": url, "analysis_type": "transcription"})
-    resp.raise_for_status()
-    job_id = resp.json().get("job_id") or resp.json().get("id")
-    transcript = await _poll_job(http, base, job_id)
+    """Instagram extraction via yt-dlp (captions + metadata)."""
+    import asyncio as _asyncio
+
+    loop = _asyncio.get_event_loop()
+    content, meta = await loop.run_in_executor(None, _extract_instagram_ytdlp, url)
+
+    if content and len(content.strip()) > 10:
+        return content, meta
+
+    # Fallback: try og: tags
+    try:
+        resp = await http.get(
+            url,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SeedStorage/2.0)"},
+        )
+        resp.raise_for_status()
+        html = resp.text
+
+        import re
+
+        og_desc = ""
+        og_title = ""
+        for match in re.finditer(
+            r'<meta\s+[^>]*property="og:description"[^>]*content="([^"]*)"', html, re.IGNORECASE
+        ):
+            og_desc = match.group(1).strip()
+            break
+        if not og_desc:
+            for match in re.finditer(
+                r'<meta\s+[^>]*content="([^"]*)"[^>]*property="og:description"', html, re.IGNORECASE
+            ):
+                og_desc = match.group(1).strip()
+                break
+        for match in re.finditer(
+            r'<meta\s+[^>]*property="og:title"[^>]*content="([^"]*)"', html, re.IGNORECASE
+        ):
+            og_title = match.group(1).strip()
+            break
+
+        parts = []
+        if og_title:
+            parts.append(og_title)
+        if og_desc:
+            parts.append(og_desc)
+        if parts:
+            return "\n\n".join(parts), {"fetch_status": "og_fallback"}
+    except Exception:
+        log.debug("Instagram og: fallback failed for %s", url, exc_info=True)
+
+    return f"[Instagram post] {url}", {"fetch_status": "no_content"}
+
+
+def _extract_instagram_ytdlp(url: str) -> tuple[str, dict]:
+    """Synchronous yt-dlp extraction for Instagram."""
+    import yt_dlp
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info:
+        return "", {}
+
+    description = (info.get("description") or "").strip()
+    title = (info.get("title") or "").strip()
+    uploader = info.get("uploader") or info.get("channel") or ""
+    uploader_id = info.get("uploader_id") or ""
+    timestamp = info.get("timestamp")
+
+    parts = []
+    if uploader:
+        parts.append(f"Instagram post by @{uploader_id or uploader}:")
+        parts.append("")
+    if title and title != description:
+        parts.append(title)
+    if description:
+        parts.append(description)
+
+    text = "\n".join(parts)
 
     meta: dict = {}
-    visuals_important, reason = await _adjudicate(anthropic, transcript)
-    meta["adjudicator_decision"] = visuals_important
-    meta["adjudicator_reason"] = reason
+    if uploader:
+        meta["author"] = f"@{uploader_id or uploader}"
+        meta["speakers"] = [{"name": uploader, "role": "creator", "platform": "instagram"}]
+    if timestamp:
+        from datetime import UTC, datetime
 
-    if visuals_important:
-        resp = await http.post(f"{base}/api/video/analyze", json={"instagram_url": url, "analysis_type": "comprehensive"})
-        resp.raise_for_status()
-        rich_id = resp.json().get("job_id") or resp.json().get("id")
-        rich = await _poll_job(http, base, rich_id)
-        meta["media_analysis"] = rich
-        return f"{transcript}\n\n---\nVisual Analysis:\n{rich}", meta
+        meta["published_at"] = datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
 
-    return transcript, meta
+    return text, meta
 
 
-async def _process_instagram_image(
-    http: httpx.AsyncClient, url: str
-) -> tuple[str, dict]:
+async def _process_instagram_image(http: httpx.AsyncClient, url: str) -> tuple[str, dict]:
     """Extract Instagram image post caption via instaloader (no auth required)."""
     shortcode = _extract_instagram_shortcode(url)
     if not shortcode:
@@ -260,7 +347,10 @@ async def _process_youtube(
 
     if visuals_important:
         try:
-            resp = await http.post(f"{base}/api/video/analyze", json={"url": url, "analysis_type": "visual_description"})
+            resp = await http.post(
+                f"{base}/api/video/analyze",
+                json={"url": url, "analysis_type": "visual_description"},
+            )
             resp.raise_for_status()
             job_id = resp.json().get("job_id") or resp.json().get("id")
             rich = await _poll_job(http, base, job_id)
@@ -315,7 +405,13 @@ async def _process_github(http: httpx.AsyncClient, url: str) -> tuple[str, dict]
         "language": language,
         "topics": topics,
         "published_at": meta_data.get("created_at", ""),
-        "speakers": [{"name": meta_data.get("owner", {}).get("login", owner), "role": "maintainer", "platform": "github"}],
+        "speakers": [
+            {
+                "name": meta_data.get("owner", {}).get("login", owner),
+                "role": "maintainer",
+                "platform": "github",
+            }
+        ],
     }
 
 
@@ -401,19 +497,56 @@ def _extract_tweet_info(url: str) -> tuple[str, str]:
 
 
 async def _process_web(http: httpx.AsyncClient, url: str) -> tuple[str, dict]:
-    """Readability article extraction."""
-    from readability import Document
+    """Webpage extraction: trafilatura primary, readability-lxml fallback."""
     from bs4 import BeautifulSoup
 
     resp = await http.get(url, follow_redirects=True)
     resp.raise_for_status()
+    html = resp.text
 
-    doc = Document(resp.text)
-    title = doc.short_title() or ""
-    soup = BeautifulSoup(doc.summary(), "lxml")
-    text = soup.get_text(separator="\n", strip=True)
+    # --- Attempt 1: trafilatura (better recall) ---
+    text: str | None = None
+    title: str = ""
+    try:
+        import trafilatura
 
-    full_soup = BeautifulSoup(resp.text, "lxml")
+        text = trafilatura.extract(
+            html,
+            include_links=False,
+            include_images=False,
+            include_tables=True,
+            favor_recall=True,
+            deduplicate=True,
+        )
+        if text:
+            meta_obj = trafilatura.extract_metadata(html)
+            if meta_obj and meta_obj.title:
+                title = meta_obj.title
+    except Exception:
+        log.debug("trafilatura failed for %s, trying readability", url)
+
+    # --- Attempt 2: readability-lxml fallback ---
+    if not text:
+        try:
+            from readability import Document
+
+            doc = Document(html)
+            title = doc.short_title() or ""
+            soup = BeautifulSoup(doc.summary(), "lxml")
+            text = soup.get_text(separator="\n", strip=True)
+            if len(text) < 50:
+                text = None
+        except Exception:
+            log.debug("readability fallback failed for %s", url)
+
+    if not text:
+        raise RuntimeError(f"Could not extract text from {url}")
+
+    # Truncate at ~8000 tokens
+    if len(text) > 32_000:
+        text = text[:32_000]
+
+    full_soup = BeautifulSoup(html, "lxml")
     author = ""
     for attr in [{"name": "author"}, {"property": "og:author"}, {"name": "twitter:creator"}]:
         tag = full_soup.find("meta", attrs=attr)
@@ -522,11 +655,17 @@ async def _poll_job(http: httpx.AsyncClient, base: str, job_id: str, timeout: in
             if isinstance(result, dict):
                 analysis = result.get("analysis", result)
                 if isinstance(analysis, dict):
-                    return analysis.get("text", "") or analysis.get("transcription", "") or str(analysis)
+                    return (
+                        analysis.get("text", "")
+                        or analysis.get("transcription", "")
+                        or str(analysis)
+                    )
                 return str(analysis)
             return str(result)
         if status in ("failed", "error", "FAILED"):
-            raise RuntimeError(f"Job {job_id} failed: {data.get('error_message') or data.get('error')}")
+            raise RuntimeError(
+                f"Job {job_id} failed: {data.get('error_message') or data.get('error')}"
+            )
         await asyncio.sleep(3)
         elapsed += 3
     raise TimeoutError(f"Job {job_id} timed out")
@@ -559,6 +698,7 @@ def _get_yt_transcript(video_id: str) -> str:
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--concurrency", type=int, default=3)
