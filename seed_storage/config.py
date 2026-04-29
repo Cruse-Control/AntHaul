@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     # --- Budget / expansion limits ---
     DAILY_LLM_BUDGET: float = 5.00
     HARD_DEPTH_CEILING: int = 5
-    MAX_EXPANSION_BREADTH: int = 20
+    MAX_EXPANSION_BREADTH: int = 8
     FRONTIER_AUTO_ENABLED: bool = True
     RATE_LIMIT_PER_MINUTE: int = 100
 

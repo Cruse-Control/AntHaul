@@ -23,6 +23,7 @@ DEPTH_POLICIES: dict[str, int] = {
     "webpage": 4,
     "tweet": 1,
     "twitter": 1,
+    "instagram": 0,  # requires auth — block from frontier expansion
     "unknown": 2,
     "fallback": 1,
     "default": 3,
@@ -48,6 +49,7 @@ RESOLVER_BONUS: dict[str, float] = {
     "webpage": 0.0,
     "tweet": 0.1,
     "twitter": 0.1,
+    "instagram": -1.0,  # requires auth — deprioritize
     "unknown": 0.0,
     "fallback": -0.1,
 }
