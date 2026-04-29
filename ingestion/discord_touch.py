@@ -134,6 +134,10 @@ async def alert(
         color: Embed sidebar color. Red=0xFF0000, Orange=0xFF8C00, Green=0x00FF00.
         urgent: If True, prepend @here mention to ping channel members.
     """
+    if not channel_id:
+        log.debug("discord_touch.alert: channel_id is empty — skipping (DISCORD_OPS_ALERTS_CHANNEL not configured)")
+        return
+
     token = _get_token()
     if not token:
         log.warning("No Discord token available — skipping alert")

@@ -61,29 +61,25 @@ DISCORD_API = "https://discord.com/api/v10"
 
 async def start_watcher():
     """Connect to Discord and start watching for URLs and text."""
-    # Prefer file-injected credential (real token, needed for WebSocket gateway).
-    # Falls back to env var (may be a proxy token — works for REST but not WS).
-    token_file = os.environ.get("DISCORD_BOT_ANT_FARM_FILE_PATH", "")
-    if token_file and os.path.exists(token_file):
-        token = open(token_file).read().strip()
-        log.info("Loaded Discord token from file: %s", token_file)
-    else:
-        token = os.environ.get("DISCORD_BOT_ANT_FARM_TOKEN", "")
-    if not token:
-        log.error("DISCORD_BOT_ANT_FARM_TOKEN not set")
-        return
-    # Credential value may include "Bot " prefix (ant-keeper convention).
-    # Strip it since discord.py and our HTTP calls add it themselves.
-    if token.startswith("Bot "):
-        token = token[4:]
+    from seed_storage.config import settings
 
+    # Use settings (file-mode credential resolved at startup via DISCORD_BOT_TOKEN_PATH).
+    # This is the same credential path as seed_storage/ingestion/bot.py.
+    token = settings.DISCORD_BOT_TOKEN
+    if not token:
+        log.error("DISCORD_BOT_TOKEN not available — check DISCORD_BOT_TOKEN_PATH credential")
+        return
+
+    # Use DISCORD_CHANNEL_IDS from settings (injected by ant-haul task manifest).
+    # Falls back to WATCHED_CHANNELS env var for backwards compatibility.
+    channel_ids_raw = settings.DISCORD_CHANNEL_IDS or os.environ.get("WATCHED_CHANNELS", "")
     watched_ids = {
-        int(ch)
-        for ch in os.environ.get("WATCHED_CHANNELS", "").split(",")
+        int(ch.strip())
+        for ch in channel_ids_raw.split(",")
         if ch.strip()
     }
     if not watched_ids:
-        log.error("WATCHED_CHANNELS not set")
+        log.error("No channel IDs configured — set DISCORD_CHANNEL_IDS in ant-haul task env")
         return
 
     intents = discord.Intents.default()

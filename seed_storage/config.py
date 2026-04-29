@@ -282,8 +282,8 @@ BATCH_SIZE_DEFAULT: int = 200
 EXTRACTION_CONCURRENCY: int = 3
 LOADER_CONCURRENCY: int = 1
 
-# Discord ops channel for alerts (empty = alerts disabled)
-DISCORD_OPS_ALERTS_CHANNEL: str = ""
+# Discord ops channel for alerts — #seed-storage
+DISCORD_OPS_ALERTS_CHANNEL: str = "1487354063749382234"
 
 
 # ---------------------------------------------------------------------------
