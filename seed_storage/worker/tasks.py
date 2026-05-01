@@ -647,26 +647,15 @@ async def _enrich_and_extract_item(item: dict, alias_map: dict) -> None:
 
 
 async def _load_item_to_graph(item: dict, alias_map: dict) -> None:
-    """Load a single staging item into Neo4j (async helper for ingest_episode).
-
-    Each call to this function may run inside a different asyncio.run() event loop
-    (Celery tasks are sync, bridged via asyncio.run()). The cached AsyncDriver in
-    graph._driver binds its internal futures to the event loop that created it. If
-    a stale driver from a previous (now closed) loop is reused, Neo4j raises
-    "got Future attached to a different loop". We force-reset the cached driver
-    before each use to guarantee a fresh driver bound to the current loop.
-    """
+    """Load a single staging item into Neo4j (async helper for ingest_episode)."""
     from ingestion.loader import _load_one_item
-    import seed_storage.graph as _graph
+    from seed_storage.graph import close, get_driver
 
-    # Force-discard stale driver — cannot await close() because the old driver's
-    # futures are bound to a dead event loop and would raise the same error.
-    _graph._driver = None
-    driver = await _graph.get_driver()
+    driver = await get_driver()
     try:
         await _load_one_item(item, alias_map, None, driver, batch_id=None)
     finally:
-        await _graph.close()
+        await close()
 
 
 def _parse_timestamp(timestamp_str: str) -> datetime:

@@ -100,6 +100,20 @@ Key namespaces:
 - **`send_alert()`:** synchronous `httpx.Client` — never use `asyncio.run()`
 - **Worker pool:** default prefork. Never `--pool=gevent`
 
+**`asyncio.run()` and cached async resources — critical footgun:** Each `asyncio.run()` creates a new event loop and destroys it on return. Any async resource cached in a module global (e.g. an `AsyncDriver`, an `AsyncClient`) binds its internal futures/connections to the loop that created it. If a subsequent `asyncio.run()` reuses that cached resource, it crashes with `got Future attached to a different loop`.
+
+**How we handle this:** `graph.get_driver()` tracks the event loop that created the cached driver via `_driver_loop_id`. On each call it checks `id(asyncio.get_running_loop())` — if the loop changed, the stale driver is discarded and a fresh one created. This protects all callers automatically. Any new cached async singleton must follow this same pattern.
+
+Callers that use the driver in a Celery task should still close it after use to avoid leaving connections open across task invocations:
+
+```python
+driver = await get_driver()
+try:
+    await do_work(driver)
+finally:
+    await close()
+```
+
 **Mocking async functions in integration tests:** When a Celery task calls `asyncio.run(some_async_fn(...))`, the mock must be an `AsyncMock`. Use `new=AsyncMock(return_value=[...])`.
 
 ### Embeddings: always OpenAI
@@ -260,7 +274,7 @@ Replay via `python -m seed_storage.worker.replay`.
 - **Community detection requires GDS:** Neo4j GDS plugin must be installed for Leiden algorithm. Falls back gracefully if not available.
 - **Reactions require bot + Redis pubsub:** If the bot is disconnected, reaction events are dropped silently.
 - **Ruff baseline:** Run `ruff check . && ruff format .` early when modifying code.
-- **`asyncio.run()` inside Celery tasks:** Each task uses `asyncio.run()` — creates a new event loop per invocation. Integration tests must use `AsyncMock` for async function mocks.
+- **`asyncio.run()` inside Celery tasks:** Each task creates a new event loop per invocation. Never cache async resources across calls — see "Async/sync boundary" section above. Integration tests must use `AsyncMock` for async function mocks.
 - **Health endpoint startup:** Serves 503 until dependencies are healthy.
 - **Env-mode credentials require proxy_target before deploy.**
 - **Neo4j `execute_query` parameter syntax:** Use `parameters_={"key": value}` or `**kwargs` directly. Never `params=`.

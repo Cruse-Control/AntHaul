@@ -7,6 +7,7 @@ Vector indices use text-embedding-3-small (1536 dims).
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -16,23 +17,39 @@ from neo4j import AsyncGraphDatabase, AsyncDriver
 from . import config
 
 _driver: AsyncDriver | None = None
+_driver_loop_id: int | None = None  # id() of the event loop that created the driver
 
 
 async def get_driver() -> AsyncDriver:
-    global _driver
+    """Return a cached AsyncDriver bound to the current event loop.
+
+    The driver's internal connection pool binds to the event loop that created it.
+    If the current loop differs (e.g. a new ``asyncio.run()`` call in a Celery
+    task), the stale driver is discarded and a fresh one is created.  This
+    prevents ``got Future attached to a different loop`` errors.
+    """
+    global _driver, _driver_loop_id
+    current_loop_id = id(asyncio.get_running_loop())
+    if _driver is not None and _driver_loop_id != current_loop_id:
+        # Stale driver from a previous event loop — discard without closing
+        # (the old loop is dead, so awaiting close() would itself fail).
+        _driver = None
+        _driver_loop_id = None
     if _driver is None:
         _driver = AsyncGraphDatabase.driver(
             config.NEO4J_URI,
             auth=(config.NEO4J_USER, config.NEO4J_PASSWORD),
         )
+        _driver_loop_id = current_loop_id
     return _driver
 
 
 async def close():
-    global _driver
+    global _driver, _driver_loop_id
     if _driver:
         await _driver.close()
         _driver = None
+        _driver_loop_id = None
 
 
 def _now() -> str:
